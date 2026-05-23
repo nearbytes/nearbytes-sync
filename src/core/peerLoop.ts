@@ -4,6 +4,7 @@ import { publicKeyFromHex, serializeEvent } from 'nearbytes-log';
 import { acceptData } from './acceptData.js';
 import { createFrameDecoder, encodeFrame } from './codec.js';
 import type { ObjectRef, Subject, SyncMessage } from './types.js';
+import { appendBenchMarker } from '../benchMarker.js';
 
 export interface DuplexPeer {
   write(chunk: Uint8Array): void;
@@ -99,7 +100,23 @@ export function attachPeerSession(log: Log, subject: Subject, peer: DuplexPeer):
     }
 
     if (msg.type === 'data') {
-      await acceptData(log, msg.object, msg.bytes);
+      const result = await acceptData(log, msg.object, msg.bytes);
+      if (result === 'stored') {
+        const size = msg.bytes.byteLength;
+        if (msg.object.kind === 'block') {
+          await appendBenchMarker(log, 'inbound-stored', {
+            kind: 'block',
+            hash: msg.object.hash.slice(0, 16),
+            bytes: size,
+          });
+        } else {
+          await appendBenchMarker(log, 'inbound-stored', {
+            kind: 'event',
+            channel: msg.object.channel.slice(0, 16),
+            bytes: size,
+          });
+        }
+      }
     }
   };
 
