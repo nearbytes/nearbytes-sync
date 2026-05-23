@@ -7,27 +7,52 @@ import { connectDiscoveredPeer } from './connect.js';
 import { createHyperswarmDiscovery } from './discovery/hyperswarm.js';
 import { createMdnsDiscovery } from './discovery/mdns.js';
 
+export interface StartOptions {
+  /** Join this profile subject so followers can sync with you (your public key hex). */
+  readonly serveProfilePublicKey?: string;
+}
+
 export interface SyncHandle {
   readonly friends: readonly string[];
   stop(): Promise<void>;
 }
 
-export async function start(log: Log, friends: readonly string[]): Promise<SyncHandle> {
-  const marker = `nearbytes-sync start ${new Date().toISOString()} friends=${friends.length}`;
+export async function start(
+  log: Log,
+  friends: readonly string[],
+  options: StartOptions = {},
+): Promise<SyncHandle> {
+  const marker = `nearbytes-sync start ${new Date().toISOString()} friends=${friends.length} serve=${options.serveProfilePublicKey ? 'yes' : 'no'}`;
   await log.sync.appendMarker(marker);
 
-  if (friends.length === 0) {
+  const topics: Uint8Array[] = [];
+  const topicHexes = new Set<string>();
+
+  const addTopic = async (subject: ReturnType<typeof profileSubject>): Promise<void> => {
+    const topic = await syncTopic(subject);
+    const hex = Buffer.from(topic).toString('hex');
+    if (!topicHexes.has(hex)) {
+      topicHexes.add(hex);
+      topics.push(topic);
+    }
+  };
+
+  for (const pk of friends) {
+    await addTopic(profileSubject(pk));
+  }
+  if (options.serveProfilePublicKey) {
+    await addTopic(profileSubject(options.serveProfilePublicKey));
+  }
+
+  if (topics.length === 0) {
     return { friends, async stop() {} };
   }
 
-  const topics: Uint8Array[] = [];
-  const subjects = friends.map((pk) => {
-    const subject = profileSubject(pk);
-    return subject;
-  });
-  for (const subject of subjects) {
-    topics.push(await syncTopic(subject));
-  }
+  const primarySubject = options.serveProfilePublicKey
+    ? profileSubject(options.serveProfilePublicKey)
+    : friends.length > 0
+      ? profileSubject(friends[0]!)
+      : profileSubject(options.serveProfilePublicKey!);
 
   const peerId = randomBytes(16).toString('hex');
   const discovery = createCompositeDiscovery([
@@ -42,7 +67,7 @@ export async function start(log: Log, friends: readonly string[]): Promise<SyncH
       try {
         const duplex = await connectDiscoveredPeer(discovered);
         // One framed session per transport; v0 uses the first configured friend subject on this duplex.
-        attachPeerSession(log, profileSubject(friends[0]!), duplex);
+        attachPeerSession(log, primarySubject, duplex);
         sessions.push(duplex);
       } catch {
         // ignore unreachable LAN / swarm peers

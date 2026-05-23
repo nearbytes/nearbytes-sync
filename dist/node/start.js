@@ -5,20 +5,33 @@ import { createCompositeDiscovery } from '../discovery/composite.js';
 import { connectDiscoveredPeer } from './connect.js';
 import { createHyperswarmDiscovery } from './discovery/hyperswarm.js';
 import { createMdnsDiscovery } from './discovery/mdns.js';
-export async function start(log, friends) {
-    const marker = `nearbytes-sync start ${new Date().toISOString()} friends=${friends.length}`;
+export async function start(log, friends, options = {}) {
+    const marker = `nearbytes-sync start ${new Date().toISOString()} friends=${friends.length} serve=${options.serveProfilePublicKey ? 'yes' : 'no'}`;
     await log.sync.appendMarker(marker);
-    if (friends.length === 0) {
+    const topics = [];
+    const topicHexes = new Set();
+    const addTopic = async (subject) => {
+        const topic = await syncTopic(subject);
+        const hex = Buffer.from(topic).toString('hex');
+        if (!topicHexes.has(hex)) {
+            topicHexes.add(hex);
+            topics.push(topic);
+        }
+    };
+    for (const pk of friends) {
+        await addTopic(profileSubject(pk));
+    }
+    if (options.serveProfilePublicKey) {
+        await addTopic(profileSubject(options.serveProfilePublicKey));
+    }
+    if (topics.length === 0) {
         return { friends, async stop() { } };
     }
-    const topics = [];
-    const subjects = friends.map((pk) => {
-        const subject = profileSubject(pk);
-        return subject;
-    });
-    for (const subject of subjects) {
-        topics.push(await syncTopic(subject));
-    }
+    const primarySubject = options.serveProfilePublicKey
+        ? profileSubject(options.serveProfilePublicKey)
+        : friends.length > 0
+            ? profileSubject(friends[0])
+            : profileSubject(options.serveProfilePublicKey);
     const peerId = randomBytes(16).toString('hex');
     const discovery = createCompositeDiscovery([
         createHyperswarmDiscovery(topics),
@@ -30,7 +43,7 @@ export async function start(log, friends) {
             try {
                 const duplex = await connectDiscoveredPeer(discovered);
                 // One framed session per transport; v0 uses the first configured friend subject on this duplex.
-                attachPeerSession(log, profileSubject(friends[0]), duplex);
+                attachPeerSession(log, primarySubject, duplex);
                 sessions.push(duplex);
             }
             catch {
