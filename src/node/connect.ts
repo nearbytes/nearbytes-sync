@@ -4,16 +4,23 @@ import type { DiscoveredPeer } from '../discovery/types.js';
 
 function duplexFromNetSocket(socket: Socket): DuplexPeer {
   const handlers = new Set<(chunk: Uint8Array) => void>();
+  const closeHandlers = new Set<() => void>();
   socket.on('data', (buf: Buffer) => {
     const chunk = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
     for (const handler of handlers) {
       handler(chunk);
     }
   });
+  socket.on('close', () => {
+    for (const handler of closeHandlers) {
+      handler();
+    }
+  });
   return {
     write: (chunk) => socket.write(chunk),
     onData: (cb) => handlers.add(cb),
     close: () => socket.destroy(),
+    onClose: (cb) => closeHandlers.add(cb),
   };
 }
 

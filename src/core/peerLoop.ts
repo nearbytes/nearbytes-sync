@@ -9,6 +9,7 @@ export interface DuplexPeer {
   write(chunk: Uint8Array): void;
   onData(handler: (chunk: Uint8Array) => void): void;
   close(): void;
+  onClose?(handler: () => void): void;
 }
 
 function toWireRef(ref: ReceptionObjectRef): ObjectRef {
@@ -106,10 +107,20 @@ export function attachPeerSession(log: Log, subject: Subject, peer: DuplexPeer):
     void onMessage(message);
   }));
 
-  send({
-    type: 'delta',
-    subject,
-    mode: 'global',
-    limit: 256,
-  });
+  const requestGlobalDelta = (cursor?: string): void => {
+    send({
+      type: 'delta',
+      subject,
+      mode: 'global',
+      ...(cursor !== undefined ? { cursor } : {}),
+      limit: 256,
+    });
+  };
+
+  requestGlobalDelta();
+  const pullTimer = setInterval(() => requestGlobalDelta(), 5000);
+  const stopPull = (): void => clearInterval(pullTimer);
+  if ('onClose' in peer && typeof peer.onClose === 'function') {
+    peer.onClose(stopPull);
+  }
 }
