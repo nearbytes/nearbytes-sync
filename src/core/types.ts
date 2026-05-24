@@ -38,6 +38,14 @@ export type SyncMessage =
       readonly more: boolean;
     }
   | { readonly type: 'want'; readonly objects: readonly ObjectRef[] }
-  | { readonly type: 'data'; readonly object: ObjectRef; readonly bytes: Uint8Array }
+  | {
+      readonly type: 'data';
+      readonly object: ObjectRef;
+      readonly bytes: Uint8Array;
+      /** Byte offset when the block is split across multiple data frames. */
+      readonly offset?: number;
+      /** Full block length when chunking (all chunks must arrive before store). */
+      readonly total?: number;
+    }
   | { readonly type: 'subscribe'; readonly delta: Extract<SyncMessage, { type: 'delta' }> }
   | { readonly type: 'error'; readonly code: string; readonly detail?: string };

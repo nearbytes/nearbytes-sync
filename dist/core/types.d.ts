@@ -46,6 +46,10 @@ export type SyncMessage = {
     readonly type: 'data';
     readonly object: ObjectRef;
     readonly bytes: Uint8Array;
+    /** Byte offset when the block is split across multiple data frames. */
+    readonly offset?: number;
+    /** Full block length when chunking (all chunks must arrive before store). */
+    readonly total?: number;
 } | {
     readonly type: 'subscribe';
     readonly delta: Extract<SyncMessage, {

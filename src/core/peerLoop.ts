@@ -74,6 +74,63 @@ async function missingRefs(log: Log, refs: readonly ObjectRef[]): Promise<Object
   return missing;
 }
 
+/** Keep JSON frames under ~3 MiB base64 on the wire. */
+const MAX_SYNC_DATA_CHUNK_BYTES = 2 * 1024 * 1024;
+
+type PendingBlock = { readonly total: number; readonly parts: Map<number, Uint8Array> };
+
+function sendBlockData(
+  send: (message: SyncMessage) => void,
+  ref: Extract<ObjectRef, { kind: 'block' }>,
+  bytes: Uint8Array,
+): void {
+  if (bytes.byteLength <= MAX_SYNC_DATA_CHUNK_BYTES) {
+    send({ type: 'data', object: ref, bytes });
+    return;
+  }
+  const total = bytes.byteLength;
+  for (let offset = 0; offset < total; offset += MAX_SYNC_DATA_CHUNK_BYTES) {
+    const end = Math.min(offset + MAX_SYNC_DATA_CHUNK_BYTES, total);
+    send({
+      type: 'data',
+      object: ref,
+      bytes: bytes.subarray(offset, end),
+      offset,
+      total,
+    });
+  }
+}
+
+async function acceptDataMessage(
+  log: Log,
+  msg: Extract<SyncMessage, { type: 'data' }>,
+  pendingBlocks: Map<string, PendingBlock>,
+): Promise<'stored' | 'duplicate' | 'invalid' | 'pending'> {
+  if (msg.object.kind === 'block' && msg.total != null && msg.total > 0) {
+    const key = msg.object.hash;
+    let pending = pendingBlocks.get(key);
+    if (!pending) {
+      pending = { total: msg.total, parts: new Map() };
+      pendingBlocks.set(key, pending);
+    }
+    pending.parts.set(msg.offset ?? 0, msg.bytes);
+    let received = 0;
+    for (const chunk of pending.parts.values()) {
+      received += chunk.byteLength;
+    }
+    if (received < pending.total) {
+      return 'pending';
+    }
+    const merged = new Uint8Array(pending.total);
+    for (const [offset, chunk] of pending.parts) {
+      merged.set(chunk, offset);
+    }
+    pendingBlocks.delete(key);
+    return acceptData(log, msg.object, merged);
+  }
+  return acceptData(log, msg.object, msg.bytes);
+}
+
 /** SYNC-12: blocks before events in separate want messages. */
 function partitionWantRefs(refs: readonly ObjectRef[]): {
   readonly blocks: ObjectRef[];
@@ -96,6 +153,7 @@ function partitionWantRefs(refs: readonly ObjectRef[]): {
  * {@code subject} MUST be the remote friend's profile subject (SYNC-07).
  */
 export function attachPeerSession(log: Log, subject: Subject, peer: DuplexPeer): () => void {
+  const pendingBlocks = new Map<string, PendingBlock>();
   let wire = Promise.resolve();
   const runSerial = (fn: () => void | Promise<void>): void => {
     wire = wire
@@ -193,8 +251,8 @@ export function attachPeerSession(log: Log, subject: Subject, peer: DuplexPeer):
       const { blocks, events } = partitionWantRefs(msg.objects);
       for (const ref of blocks) {
         const bytes = await readLocalBytes(log, ref);
-        if (bytes) {
-          send({ type: 'data', object: ref, bytes });
+        if (bytes && ref.kind === 'block') {
+          sendBlockData(send, ref, bytes);
         }
       }
       for (const ref of events) {
@@ -207,9 +265,12 @@ export function attachPeerSession(log: Log, subject: Subject, peer: DuplexPeer):
     }
 
     if (msg.type === 'data') {
-      const result = await acceptData(log, msg.object, msg.bytes);
+      const result = await acceptDataMessage(log, msg, pendingBlocks);
       if (result === 'stored') {
-        const size = msg.bytes.byteLength;
+        const size =
+          msg.object.kind === 'block' && msg.total != null && msg.total > 0
+            ? msg.total
+            : msg.bytes.byteLength;
         if (msg.object.kind === 'block') {
           await appendBenchMarker(log, 'inbound-stored', {
             kind: 'block',
@@ -239,7 +300,10 @@ export function attachPeerSession(log: Log, subject: Subject, peer: DuplexPeer):
   });
   requestGlobalDelta();
 
-  const stop = (): void => unregister();
+  const stop = (): void => {
+    pendingBlocks.clear();
+    unregister();
+  };
   if ('onClose' in peer && typeof peer.onClose === 'function') {
     peer.onClose(stop);
   }

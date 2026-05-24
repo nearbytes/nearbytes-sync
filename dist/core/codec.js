@@ -23,17 +23,26 @@ function encodePayload(message) {
     const wire = { ...message };
     if (message.type === 'data') {
         wire['bytes'] = bytesToBase64(message.bytes);
+        if (message.offset !== undefined) {
+            wire['offset'] = message.offset;
+        }
+        if (message.total !== undefined) {
+            wire['total'] = message.total;
+        }
     }
     return new TextEncoder().encode(JSON.stringify(wire));
 }
 function decodePayload(bytes) {
     const wire = JSON.parse(new TextDecoder().decode(bytes));
     if (wire.type === 'data' && typeof wire['bytes'] === 'string') {
-        return {
-            type: 'data',
-            object: wire['object'],
-            bytes: base64ToBytes(wire['bytes']),
-        };
+        const object = wire['object'];
+        const bytes = base64ToBytes(wire['bytes']);
+        const offset = typeof wire['offset'] === 'number' ? wire['offset'] : undefined;
+        const total = typeof wire['total'] === 'number' ? wire['total'] : undefined;
+        if (offset !== undefined || total !== undefined) {
+            return { type: 'data', object, bytes, offset, total };
+        }
+        return { type: 'data', object, bytes };
     }
     return wire;
 }
