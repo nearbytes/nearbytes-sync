@@ -5,6 +5,7 @@ import { acceptData } from './acceptData.js';
 import { createFrameDecoder, encodeFrame } from './codec.js';
 import type { ObjectRef, Subject, SyncMessage } from './types.js';
 import { appendBenchMarker } from '../benchMarker.js';
+import { registerLocalHaveAnnouncer, type LocalHaveAnnouncer } from './sessionRegistry.js';
 
 export interface DuplexPeer {
   write(chunk: Uint8Array): void;
@@ -13,11 +14,26 @@ export interface DuplexPeer {
   onClose?(handler: () => void): void;
 }
 
-function toWireRef(ref: ReceptionObjectRef): ObjectRef {
+async function toWireRef(log: Log, ref: ReceptionObjectRef): Promise<ObjectRef> {
   if (ref.kind === 'block') {
     return { kind: 'block', hash: ref.hash };
   }
-  return { kind: 'event', channel: ref.channel, hash: ref.hash };
+  const pk = publicKeyFromHex(ref.channel);
+  if (!pk) {
+    return { kind: 'event', channel: ref.channel, hash: ref.hash };
+  }
+  try {
+    const event = await log.events.retrieveEvent(pk, ref.hash as Hash);
+    const blockRefs = event.envelope.blockRefs.map((h) => h as string);
+    return {
+      kind: 'event',
+      channel: ref.channel,
+      hash: ref.hash,
+      ...(blockRefs.length > 0 ? { blockRefs } : {}),
+    };
+  } catch {
+    return { kind: 'event', channel: ref.channel, hash: ref.hash };
+  }
 }
 
 async function readLocalBytes(log: Log, ref: ObjectRef): Promise<Uint8Array | null> {
@@ -42,55 +58,146 @@ async function hasObject(log: Log, ref: ObjectRef): Promise<boolean> {
   }
   const pk = publicKeyFromHex(ref.channel);
   if (!pk) {
-    return true;
+    return false;
   }
   const events = await log.events.listEvents(pk);
   return events.includes(ref.hash as Hash);
 }
 
-export function attachPeerSession(log: Log, subject: Subject, peer: DuplexPeer): void {
-  const send = (message: SyncMessage): void => {
-    peer.write(encodeFrame(message));
+async function missingRefs(log: Log, refs: readonly ObjectRef[]): Promise<ObjectRef[]> {
+  const missing: ObjectRef[] = [];
+  for (const ref of refs) {
+    if (!(await hasObject(log, ref))) {
+      missing.push(ref);
+    }
+  }
+  return missing;
+}
+
+/** SYNC-12: blocks before events in separate want messages. */
+function partitionWantRefs(refs: readonly ObjectRef[]): {
+  readonly blocks: ObjectRef[];
+  readonly events: ObjectRef[];
+} {
+  const blocks: ObjectRef[] = [];
+  const events: ObjectRef[] = [];
+  for (const ref of refs) {
+    if (ref.kind === 'block') {
+      blocks.push(ref);
+    } else {
+      events.push(ref);
+    }
+  }
+  return { blocks, events };
+}
+
+/**
+ * Attaches anti-entropy on an association that already completed {@code hello}.
+ * {@code subject} MUST be the remote friend's profile subject (SYNC-07).
+ */
+export function attachPeerSession(log: Log, subject: Subject, peer: DuplexPeer): () => void {
+  let wire = Promise.resolve();
+  const runSerial = (fn: () => void | Promise<void>): void => {
+    wire = wire
+      .then(async () => {
+        await fn();
+      })
+      .catch(() => {
+        /* keep queue alive after handler errors */
+      });
   };
 
+  const send = (message: SyncMessage): void => {
+    runSerial(() => {
+      peer.write(encodeFrame(message));
+    });
+  };
+
+  const sendHave = async (
+    refs: readonly ReceptionObjectRef[],
+    more = false,
+    nextCursor?: string,
+  ): Promise<void> => {
+    if (refs.length === 0 && !more) {
+      return;
+    }
+    const objects: ObjectRef[] = [];
+    for (const ref of refs) {
+      objects.push(await toWireRef(log, ref));
+    }
+    send({
+      type: 'have',
+      subject,
+      objects,
+      more,
+      ...(nextCursor !== undefined ? { nextCursor } : {}),
+    });
+  };
+
+  const requestGlobalDelta = (cursor?: string): void => {
+    send({
+      type: 'delta',
+      subject,
+      mode: 'global',
+      ...(cursor !== undefined ? { cursor } : {}),
+      limit: 256,
+    });
+  };
+
+  const sendWants = (refs: readonly ObjectRef[]): void => {
+    const { blocks, events } = partitionWantRefs(refs);
+    if (blocks.length > 0) {
+      send({ type: 'want', objects: blocks });
+    }
+    if (events.length > 0) {
+      send({ type: 'want', objects: events });
+    }
+  };
+
+  const announcer: LocalHaveAnnouncer = {
+    pushLocalHave(refs) {
+      void sendHave(refs, false);
+    },
+  };
+  const unregister = registerLocalHaveAnnouncer(announcer);
+
   const onMessage = async (msg: SyncMessage): Promise<void> => {
+    if (msg.type === 'hello') {
+      return;
+    }
+
     if (msg.type === 'delta' && msg.mode === 'global') {
       const out = await log.reception.listAfter(msg.cursor, msg.limit);
-      send({
-        type: 'have',
-        subject,
-        fromCursor: msg.cursor,
-        nextCursor: out.next,
-        objects: out.refs.map(toWireRef),
-        more: out.more,
-      });
+      await sendHave(out.refs, out.more, out.next);
+      return;
+    }
+
+    if (msg.type === 'subscribe' && msg.delta.mode === 'global') {
+      const out = await log.reception.listAfter(msg.delta.cursor, msg.delta.limit ?? 256);
+      await sendHave(out.refs, out.more, out.next);
       return;
     }
 
     if (msg.type === 'have') {
-      const wants: ObjectRef[] = [];
-      for (const ref of msg.objects) {
-        if (!(await hasObject(log, ref))) {
-          wants.push(ref);
-        }
-      }
+      const wants = await missingRefs(log, msg.objects);
       if (wants.length > 0) {
-        send({ type: 'want', objects: wants });
+        sendWants(wants);
       }
       if (msg.more && msg.nextCursor) {
-        send({
-          type: 'delta',
-          subject,
-          mode: 'global',
-          cursor: msg.nextCursor,
-          limit: 256,
-        });
+        requestGlobalDelta(msg.nextCursor);
       }
       return;
     }
 
     if (msg.type === 'want') {
-      for (const ref of msg.objects) {
+      const { blocks, events } = partitionWantRefs(msg.objects);
+      for (const ref of blocks) {
+        const bytes = await readLocalBytes(log, ref);
+        if (bytes) {
+          send({ type: 'data', object: ref, bytes });
+        }
+      }
+      for (const ref of events) {
         const bytes = await readLocalBytes(log, ref);
         if (bytes) {
           send({ type: 'data', object: ref, bytes });
@@ -120,24 +227,21 @@ export function attachPeerSession(log: Log, subject: Subject, peer: DuplexPeer):
     }
   };
 
-  peer.onData(createFrameDecoder((message) => {
-    void onMessage(message);
-  }));
+  peer.onData(
+    createFrameDecoder((message) => {
+      runSerial(() => onMessage(message));
+    }),
+  );
 
-  const requestGlobalDelta = (cursor?: string): void => {
-    send({
-      type: 'delta',
-      subject,
-      mode: 'global',
-      ...(cursor !== undefined ? { cursor } : {}),
-      limit: 256,
-    });
-  };
-
+  send({
+    type: 'subscribe',
+    delta: { type: 'delta', subject, mode: 'global', limit: 256 },
+  });
   requestGlobalDelta();
-  const pullTimer = setInterval(() => requestGlobalDelta(), 5000);
-  const stopPull = (): void => clearInterval(pullTimer);
+
+  const stop = (): void => unregister();
   if ('onClose' in peer && typeof peer.onClose === 'function') {
-    peer.onClose(stopPull);
+    peer.onClose(stop);
   }
+  return stop;
 }

@@ -1,12 +1,28 @@
 import { randomBytes } from 'crypto';
-import { attachPeerSession } from '../core/peerLoop.js';
 import { profileSubject, syncTopic } from '../core/topic.js';
 import { createCompositeDiscovery } from '../discovery/composite.js';
 import { connectDiscoveredPeer } from './connect.js';
 import { createHyperswarmDiscovery } from './discovery/hyperswarm.js';
 import { createMdnsDiscovery } from './discovery/mdns.js';
+import { appendBenchMarker } from '../benchMarker.js';
+import { patchLogForReactiveHave } from '../core/sessionRegistry.js';
+import { exchangeFriendHandshake } from '../core/handshake.js';
+import { FriendSessionRegistry } from '../core/friendSessions.js';
+function normalizeFriendSet(friends) {
+    const set = new Set();
+    for (const pk of friends) {
+        set.add(pk.toLowerCase());
+    }
+    return set;
+}
 export async function start(log, friends, options = {}) {
-    const marker = `nearbytes-sync start ${new Date().toISOString()} friends=${friends.length} serve=${options.serveProfilePublicKey ? 'yes' : 'no'}`;
+    patchLogForReactiveHave(log);
+    const friendSet = normalizeFriendSet(friends);
+    const localProfile = options.serveProfilePublicKey?.toLowerCase();
+    if (!localProfile) {
+        throw new Error('friend carriage requires serveProfilePublicKey (configure profileSecret)');
+    }
+    const marker = `nearbytes-sync start ${new Date().toISOString()} friends=${friends.length} serve=yes`;
     await log.sync.appendMarker(marker);
     const topics = [];
     const topicHexes = new Set();
@@ -21,43 +37,78 @@ export async function start(log, friends, options = {}) {
     for (const pk of friends) {
         await addTopic(profileSubject(pk));
     }
-    if (options.serveProfilePublicKey) {
-        await addTopic(profileSubject(options.serveProfilePublicKey));
-    }
-    if (topics.length === 0) {
+    await addTopic(profileSubject(localProfile));
+    if (topics.length === 0 || friendSet.size === 0) {
         return { friends, async stop() { } };
     }
-    const primarySubject = options.serveProfilePublicKey
-        ? profileSubject(options.serveProfilePublicKey)
-        : friends.length > 0
-            ? profileSubject(friends[0])
-            : profileSubject(options.serveProfilePublicKey);
     const peerId = randomBytes(16).toString('hex');
     const discovery = createCompositeDiscovery([
         createHyperswarmDiscovery(topics),
-        createMdnsDiscovery({ peerId }),
+        createMdnsDiscovery({
+            peerId,
+            profilePublicKey: localProfile,
+            friendProfileKeys: friendSet,
+        }),
     ]);
-    const sessions = [];
-    discovery.onPeer((discovered) => {
+    const friendSessions = new FriendSessionRegistry();
+    const connectingFriends = new Set();
+    const openFriendAssociation = (discovered, expectedRemote) => {
         void (async () => {
+            let remoteHint = expectedRemote?.toLowerCase();
             try {
                 const duplex = await connectDiscoveredPeer(discovered);
-                // One framed session per transport; v0 uses the first configured friend subject on this duplex.
-                attachPeerSession(log, primarySubject, duplex);
-                sessions.push(duplex);
+                if (remoteHint !== undefined && !friendSet.has(remoteHint)) {
+                    duplex.close();
+                    return;
+                }
+                const remoteProfile = await exchangeFriendHandshake(duplex, {
+                    localProfilePublicKey: localProfile,
+                    subject: profileSubject(remoteHint ?? localProfile),
+                    allowedRemoteProfiles: friendSet,
+                });
+                remoteHint = remoteProfile;
+                if (connectingFriends.has(remoteProfile)) {
+                    duplex.close();
+                    return;
+                }
+                connectingFriends.add(remoteProfile);
+                await appendBenchMarker(log, 'peer-connected', {
+                    transport: discovered.transport,
+                    label: discovered.label.slice(0, 64),
+                });
+                friendSessions.attach(log, remoteProfile, duplex);
+                await appendBenchMarker(log, 'friend-session-attached', {
+                    remote: remoteProfile.slice(0, 16),
+                });
+                connectingFriends.delete(remoteProfile);
             }
             catch {
-                // ignore unreachable LAN / swarm peers
+                if (remoteHint !== undefined) {
+                    connectingFriends.delete(remoteHint);
+                }
             }
         })();
+    };
+    discovery.onPeer((discovered) => {
+        if (discovered.transport === 'tcp') {
+            if (!friendSet.has(discovered.profilePublicKey)) {
+                return;
+            }
+            openFriendAssociation(discovered, discovered.profilePublicKey);
+            return;
+        }
+        openFriendAssociation(discovered);
     });
     await discovery.start();
+    await appendBenchMarker(log, 'discovery-started', {
+        topics: topics.length,
+        friends: friends.length,
+        serve: 1,
+    });
     return {
         friends,
         async stop() {
-            for (const session of sessions) {
-                session.close();
-            }
+            friendSessions.closeAll();
             await discovery.stop();
             await log.sync.appendMarker(`nearbytes-sync stop ${new Date().toISOString()}`);
         },

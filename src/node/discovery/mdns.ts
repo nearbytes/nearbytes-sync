@@ -31,7 +31,12 @@ function duplexFromNetSocket(socket: Socket): DuplexPeer {
   };
 }
 
-export function createMdnsDiscovery(options: { readonly peerId: string }): PeerDiscovery {
+export function createMdnsDiscovery(options: {
+  readonly peerId: string;
+  readonly profilePublicKey: string;
+  readonly friendProfileKeys: ReadonlySet<string>;
+}): PeerDiscovery {
+  const localProfile = options.profilePublicKey.toLowerCase();
   let peerHandler: ((peer: DiscoveredPeer) => void) | null = null;
   let bonjour: InstanceType<typeof Bonjour> | null = null;
   let browser: ReturnType<InstanceType<typeof Bonjour>['find']> | null = null;
@@ -40,6 +45,9 @@ export function createMdnsDiscovery(options: { readonly peerId: string }): PeerD
   let multicastSocket: dgram.Socket | null = null;
   let multicastTimer: ReturnType<typeof setInterval> | null = null;
   const seenTcp = new Set<string>();
+
+  const isFriendProfile = (profilePublicKey: string): boolean =>
+    options.friendProfileKeys.has(profilePublicKey.toLowerCase());
 
   return {
     async start(): Promise<void> {
@@ -68,7 +76,11 @@ export function createMdnsDiscovery(options: { readonly peerId: string }): PeerD
       });
 
       bonjour = new Bonjour();
-      const txt = buildLanDiscoveryTxtRecord({ peerId: options.peerId, syncPort });
+      const txt = buildLanDiscoveryTxtRecord({
+        peerId: options.peerId,
+        syncPort,
+        profilePublicKey: localProfile,
+      });
       bonjour.publish({
         name: `nearbytes-${options.peerId.slice(0, 8)}`,
         type: LAN_DISCOVERY_SERVICE_TYPE,
@@ -86,21 +98,28 @@ export function createMdnsDiscovery(options: { readonly peerId: string }): PeerD
         if (!peerHandler || !service.addresses?.length) {
           return;
         }
-        const txt = parseLanDiscoveryTxtRecord((service.txt ?? {}) as Record<string, unknown>);
-        if (!txt || txt.alpn !== LAN_TRANSPORT_PROFILE_ID) {
+        const parsed = parseLanDiscoveryTxtRecord((service.txt ?? {}) as Record<string, unknown>);
+        if (!parsed || parsed.alpn !== LAN_TRANSPORT_PROFILE_ID) {
+          return;
+        }
+        if (parsed.peerId === options.peerId || parsed.profilePublicKey === localProfile) {
+          return;
+        }
+        if (!isFriendProfile(parsed.profilePublicKey)) {
           return;
         }
         const host = service.addresses.find((a: string) => !a.includes(':')) ?? service.addresses[0];
-        const key = `${host}:${txt.syncPort}`;
+        const key = `${parsed.profilePublicKey}:${host}:${parsed.syncPort}`;
         if (seenTcp.has(key)) {
           return;
         }
         seenTcp.add(key);
         peerHandler({
           transport: 'tcp',
-          label: `mdns:${txt.peerId}`,
+          label: `mdns:${parsed.peerId}`,
           host,
-          port: txt.syncPort,
+          port: parsed.syncPort,
+          profilePublicKey: parsed.profilePublicKey,
         });
       });
 
@@ -115,6 +134,7 @@ export function createMdnsDiscovery(options: { readonly peerId: string }): PeerD
         peer: options.peerId,
         port: syncPort,
         alpn: LAN_TRANSPORT_PROFILE_ID,
+        prof: localProfile,
       });
       const payload = new TextEncoder().encode(announcement);
       multicastTimer = setInterval(() => {

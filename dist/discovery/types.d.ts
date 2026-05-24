@@ -4,11 +4,14 @@ export type DiscoveredPeer = {
     readonly transport: 'duplex';
     readonly label: string;
     readonly connect: () => Promise<DuplexPeer>;
+    /** Set when discovery already knows the remote profile key (e.g. mDNS TXT). */
+    readonly profilePublicKey?: string;
 } | {
     readonly transport: 'tcp';
     readonly label: string;
     readonly host: string;
     readonly port: number;
+    readonly profilePublicKey: string;
 };
 export interface PeerDiscovery {
     start(): Promise<void>;

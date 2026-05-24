@@ -1,11 +1,29 @@
 import { publicKeyFromHex, serializeEvent } from 'nearbytes-log';
 import { acceptData } from './acceptData.js';
 import { createFrameDecoder, encodeFrame } from './codec.js';
-function toWireRef(ref) {
+import { appendBenchMarker } from '../benchMarker.js';
+import { registerLocalHaveAnnouncer } from './sessionRegistry.js';
+async function toWireRef(log, ref) {
     if (ref.kind === 'block') {
         return { kind: 'block', hash: ref.hash };
     }
-    return { kind: 'event', channel: ref.channel, hash: ref.hash };
+    const pk = publicKeyFromHex(ref.channel);
+    if (!pk) {
+        return { kind: 'event', channel: ref.channel, hash: ref.hash };
+    }
+    try {
+        const event = await log.events.retrieveEvent(pk, ref.hash);
+        const blockRefs = event.envelope.blockRefs.map((h) => h);
+        return {
+            kind: 'event',
+            channel: ref.channel,
+            hash: ref.hash,
+            ...(blockRefs.length > 0 ? { blockRefs } : {}),
+        };
+    }
+    catch {
+        return { kind: 'event', channel: ref.channel, hash: ref.hash };
+    }
 }
 async function readLocalBytes(log, ref) {
     try {
@@ -29,51 +47,127 @@ async function hasObject(log, ref) {
     }
     const pk = publicKeyFromHex(ref.channel);
     if (!pk) {
-        return true;
+        return false;
     }
     const events = await log.events.listEvents(pk);
     return events.includes(ref.hash);
 }
+async function missingRefs(log, refs) {
+    const missing = [];
+    for (const ref of refs) {
+        if (!(await hasObject(log, ref))) {
+            missing.push(ref);
+        }
+    }
+    return missing;
+}
+/** SYNC-12: blocks before events in separate want messages. */
+function partitionWantRefs(refs) {
+    const blocks = [];
+    const events = [];
+    for (const ref of refs) {
+        if (ref.kind === 'block') {
+            blocks.push(ref);
+        }
+        else {
+            events.push(ref);
+        }
+    }
+    return { blocks, events };
+}
+/**
+ * Attaches anti-entropy on an association that already completed {@code hello}.
+ * {@code subject} MUST be the remote friend's profile subject (SYNC-07).
+ */
 export function attachPeerSession(log, subject, peer) {
-    const send = (message) => {
-        peer.write(encodeFrame(message));
+    let wire = Promise.resolve();
+    const runSerial = (fn) => {
+        wire = wire
+            .then(async () => {
+            await fn();
+        })
+            .catch(() => {
+            /* keep queue alive after handler errors */
+        });
     };
+    const send = (message) => {
+        runSerial(() => {
+            peer.write(encodeFrame(message));
+        });
+    };
+    const sendHave = async (refs, more = false, nextCursor) => {
+        if (refs.length === 0 && !more) {
+            return;
+        }
+        const objects = [];
+        for (const ref of refs) {
+            objects.push(await toWireRef(log, ref));
+        }
+        send({
+            type: 'have',
+            subject,
+            objects,
+            more,
+            ...(nextCursor !== undefined ? { nextCursor } : {}),
+        });
+    };
+    const requestGlobalDelta = (cursor) => {
+        send({
+            type: 'delta',
+            subject,
+            mode: 'global',
+            ...(cursor !== undefined ? { cursor } : {}),
+            limit: 256,
+        });
+    };
+    const sendWants = (refs) => {
+        const { blocks, events } = partitionWantRefs(refs);
+        if (blocks.length > 0) {
+            send({ type: 'want', objects: blocks });
+        }
+        if (events.length > 0) {
+            send({ type: 'want', objects: events });
+        }
+    };
+    const announcer = {
+        pushLocalHave(refs) {
+            void sendHave(refs, false);
+        },
+    };
+    const unregister = registerLocalHaveAnnouncer(announcer);
     const onMessage = async (msg) => {
+        if (msg.type === 'hello') {
+            return;
+        }
         if (msg.type === 'delta' && msg.mode === 'global') {
             const out = await log.reception.listAfter(msg.cursor, msg.limit);
-            send({
-                type: 'have',
-                subject,
-                fromCursor: msg.cursor,
-                nextCursor: out.next,
-                objects: out.refs.map(toWireRef),
-                more: out.more,
-            });
+            await sendHave(out.refs, out.more, out.next);
+            return;
+        }
+        if (msg.type === 'subscribe' && msg.delta.mode === 'global') {
+            const out = await log.reception.listAfter(msg.delta.cursor, msg.delta.limit ?? 256);
+            await sendHave(out.refs, out.more, out.next);
             return;
         }
         if (msg.type === 'have') {
-            const wants = [];
-            for (const ref of msg.objects) {
-                if (!(await hasObject(log, ref))) {
-                    wants.push(ref);
-                }
-            }
+            const wants = await missingRefs(log, msg.objects);
             if (wants.length > 0) {
-                send({ type: 'want', objects: wants });
+                sendWants(wants);
             }
             if (msg.more && msg.nextCursor) {
-                send({
-                    type: 'delta',
-                    subject,
-                    mode: 'global',
-                    cursor: msg.nextCursor,
-                    limit: 256,
-                });
+                requestGlobalDelta(msg.nextCursor);
             }
             return;
         }
         if (msg.type === 'want') {
-            for (const ref of msg.objects) {
+            const { blocks, events } = partitionWantRefs(msg.objects);
+            for (const ref of blocks) {
+                const bytes = await readLocalBytes(log, ref);
+                if (bytes) {
+                    send({ type: 'data', object: ref, bytes });
+                }
+            }
+            for (const ref of events) {
                 const bytes = await readLocalBytes(log, ref);
                 if (bytes) {
                     send({ type: 'data', object: ref, bytes });
@@ -82,17 +176,38 @@ export function attachPeerSession(log, subject, peer) {
             return;
         }
         if (msg.type === 'data') {
-            await acceptData(log, msg.object, msg.bytes);
+            const result = await acceptData(log, msg.object, msg.bytes);
+            if (result === 'stored') {
+                const size = msg.bytes.byteLength;
+                if (msg.object.kind === 'block') {
+                    await appendBenchMarker(log, 'inbound-stored', {
+                        kind: 'block',
+                        hash: msg.object.hash.slice(0, 16),
+                        bytes: size,
+                    });
+                }
+                else {
+                    await appendBenchMarker(log, 'inbound-stored', {
+                        kind: 'event',
+                        channel: msg.object.channel.slice(0, 16),
+                        bytes: size,
+                    });
+                }
+            }
         }
     };
     peer.onData(createFrameDecoder((message) => {
-        void onMessage(message);
+        runSerial(() => onMessage(message));
     }));
     send({
-        type: 'delta',
-        subject,
-        mode: 'global',
-        limit: 256,
+        type: 'subscribe',
+        delta: { type: 'delta', subject, mode: 'global', limit: 256 },
     });
+    requestGlobalDelta();
+    const stop = () => unregister();
+    if ('onClose' in peer && typeof peer.onClose === 'function') {
+        peer.onClose(stop);
+    }
+    return stop;
 }
 //# sourceMappingURL=peerLoop.js.map
