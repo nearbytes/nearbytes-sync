@@ -90,10 +90,14 @@ export async function start(
   }
 
   const peerId = randomBytes(16).toString('hex');
+  // Default to mDNS+Hyperswarm so peers find each other across both LAN and
+  // WAN out of the box. Benchmarks that want LAN-only TCP for max throughput
+  // (no Noise encryption, no UDX framing) explicitly opt out by setting
+  // NEARBYTES_SYNC_DISCOVERY=mdns or passing `discoveryTransport: 'mdns'`.
   const transport =
     options.discoveryTransport ??
     process.env['NEARBYTES_SYNC_DISCOVERY'] ??
-    'mdns';
+    'all';
   const backends = [
     createMdnsDiscovery({
       peerId,
