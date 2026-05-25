@@ -1,1 +1,1 @@
-{"version":3,"file":"hyperswarm.d.ts","sourceRoot":"","sources":["../../../src/node/discovery/hyperswarm.ts"],"names":[],"mappings":"AAEA,OAAO,KAAK,EAAkB,aAAa,EAAE,MAAM,0BAA0B,CAAC;AAgC9E,wBAAgB,yBAAyB,CAAC,MAAM,EAAE,SAAS,UAAU,EAAE,GAAG,aAAa,CA8BtF"}
+{"version":3,"file":"hyperswarm.d.ts","sourceRoot":"","sources":["../../../src/node/discovery/hyperswarm.ts"],"names":[],"mappings":"AAGA,OAAO,KAAK,EAAkB,aAAa,EAAE,MAAM,0BAA0B,CAAC;AAyC9E,wBAAgB,yBAAyB,CAAC,MAAM,EAAE,SAAS,UAAU,EAAE,GAAG,aAAa,CAgCtF"}

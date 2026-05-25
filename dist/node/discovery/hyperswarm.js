@@ -1,5 +1,11 @@
 import Hyperswarm from 'hyperswarm';
+import { Socket } from 'net';
+import { logSyncError } from '../../logSyncError.js';
+import { duplexFromTcpSocket } from '../netDuplex.js';
 function duplexFromSocket(socket) {
+    if (socket instanceof Socket) {
+        return duplexFromTcpSocket(socket);
+    }
     const handlers = new Set();
     const closeHandlers = new Set();
     socket.on('data', (buf) => {
@@ -9,8 +15,8 @@ function duplexFromSocket(socket) {
             handler(chunk);
         }
     });
-    socket.on('error', () => {
-        /* keep sync session alive; transport may reset under dual-peer load */
+    socket.on('error', (err) => {
+        logSyncError('hyperswarm socket', err);
     });
     socket.on('close', () => {
         for (const handler of closeHandlers) {
@@ -19,7 +25,11 @@ function duplexFromSocket(socket) {
     });
     return {
         write: (chunk) => socket.write(chunk),
-        onData: (cb) => handlers.add(cb),
+        onData: (cb) => {
+            handlers.add(cb);
+            return () => handlers.delete(cb);
+        },
+        setBulkInbound: undefined,
         close: () => socket.end(),
         onClose: (cb) => closeHandlers.add(cb),
     };
@@ -31,7 +41,9 @@ export function createHyperswarmDiscovery(topics) {
         if (!peerHandler) {
             return;
         }
-        socket.on('error', () => { });
+        socket.on('error', (err) => {
+            logSyncError(`hyperswarm peer:${peerInfo.publicKey.toString('hex').slice(0, 12)}`, err);
+        });
         const duplex = duplexFromSocket(socket);
         peerHandler({
             transport: 'duplex',

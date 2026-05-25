@@ -1,15 +1,23 @@
 import { deserializeEvent, publicKeyFromHex, validateBlockBytes, validateEventBytes, } from 'nearbytes-log';
-export async function acceptData(log, ref, bytes) {
+export async function acceptData(log, ref, bytes, options) {
     if (ref.kind === 'block') {
-        const validation = await validateBlockBytes(ref.hash, bytes);
-        if (!validation.ok) {
-            return 'invalid';
-        }
         const hash = ref.hash;
         if (await log.blocks.has(hash)) {
             return 'duplicate';
         }
-        await log.blocks.store(hash, bytes, true);
+        if (options?.verifyIntegrity !== false) {
+            const validation = await validateBlockBytes(ref.hash, bytes);
+            if (!validation.ok) {
+                return 'invalid';
+            }
+        }
+        // Streaming receiver: the digest is verified (either above via
+        // `validateBlockBytes`, or incrementally inside the block stream sink
+        // when `verifyIntegrity: false`). Either way the caller asserts that
+        // `hash === SHA-256(bytes)`, so we take the log's fast path that skips
+        // the second hash. See nearbytes-specs/storage/log-api-v1.md §2.3 and
+        // requirements/sync-protocol-v1.md SYNC-36.
+        await log.blocks.storeAlreadyVerified(hash, bytes, true);
         return 'stored';
     }
     const channelHex = ref.channel.toLowerCase();

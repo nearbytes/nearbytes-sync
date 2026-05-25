@@ -6,8 +6,10 @@ import { createHyperswarmDiscovery } from './discovery/hyperswarm.js';
 import { createMdnsDiscovery } from './discovery/mdns.js';
 import { appendBenchMarker } from '../benchMarker.js';
 import { patchLogForReactiveHave } from '../core/sessionRegistry.js';
+import { logSyncError } from '../logSyncError.js';
 import { exchangeFriendHandshake } from '../core/handshake.js';
 import { FriendSessionRegistry } from '../core/friendSessions.js';
+import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
 function normalizeFriendSet(friends) {
     const set = new Set();
     for (const pk of friends) {
@@ -42,14 +44,20 @@ export async function start(log, friends, options = {}) {
         return { friends, async stop() { } };
     }
     const peerId = randomBytes(16).toString('hex');
-    const discovery = createCompositeDiscovery([
-        createHyperswarmDiscovery(topics),
+    const transport = options.discoveryTransport ??
+        process.env['NEARBYTES_SYNC_DISCOVERY'] ??
+        'mdns';
+    const backends = [
         createMdnsDiscovery({
             peerId,
             profilePublicKey: localProfile,
             friendProfileKeys: friendSet,
         }),
-    ]);
+    ];
+    if (transport === 'all') {
+        backends.unshift(createHyperswarmDiscovery(topics));
+    }
+    const discovery = createCompositeDiscovery(backends);
     const friendSessions = new FriendSessionRegistry();
     const connectingFriends = new Set();
     const openFriendAssociation = (discovered, expectedRemote) => {
@@ -76,13 +84,22 @@ export async function start(log, friends, options = {}) {
                     transport: discovered.transport,
                     label: discovered.label.slice(0, 64),
                 });
-                friendSessions.attach(log, remoteProfile, duplex);
-                await appendBenchMarker(log, 'friend-session-attached', {
-                    remote: remoteProfile.slice(0, 16),
-                });
+                const storageRoot = options.blockStorageRoot;
+                const { created } = friendSessions.attach(log, remoteProfile, duplex, {
+                    blockStorageRoot: storageRoot,
+                    ...(storageRoot
+                        ? { diskBlockStream: createNodeDiskBlockStreamFactory(storageRoot) }
+                        : {}),
+                }, discovered.label);
+                if (created) {
+                    await appendBenchMarker(log, 'friend-session-attached', {
+                        remote: remoteProfile.slice(0, 16),
+                    });
+                }
                 connectingFriends.delete(remoteProfile);
             }
-            catch {
+            catch (err) {
+                logSyncError(`friend-connect:${discovered.label}`, err);
                 if (remoteHint !== undefined) {
                     connectingFriends.delete(remoteHint);
                 }

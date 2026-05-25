@@ -2,20 +2,16 @@ import dgram from 'dgram';
 import { createServer } from 'net';
 import Bonjour from 'bonjour-service';
 import { LAN_DISCOVERY_SERVICE_PROTOCOL, LAN_DISCOVERY_SERVICE_TYPE, LAN_MULTICAST_ANNOUNCE_MS, LAN_MULTICAST_GROUP, LAN_MULTICAST_PORT, LAN_TRANSPORT_PROFILE_ID, buildLanDiscoveryTxtRecord, parseLanDiscoveryTxtRecord, } from '../../discovery/lanProfile.js';
+import { logSyncError } from '../../logSyncError.js';
+import { duplexFromTcpSocket } from '../netDuplex.js';
+import { shouldInitiateSyncTcp } from '../tcpBulk.js';
 const LAN_MULTICAST_ANNOUNCE_MS_LOCAL = LAN_MULTICAST_ANNOUNCE_MS;
 function duplexFromNetSocket(socket) {
-    const handlers = new Set();
-    socket.on('data', (buf) => {
-        const chunk = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-        for (const handler of handlers) {
-            handler(chunk);
-        }
+    const peer = duplexFromTcpSocket(socket);
+    socket.on('error', (err) => {
+        logSyncError(`mdns-tcp:${socket.remoteAddress}:${socket.remotePort}`, err);
     });
-    return {
-        write: (chunk) => socket.write(chunk),
-        onData: (cb) => handlers.add(cb),
-        close: () => socket.destroy(),
-    };
+    return peer;
 }
 export function createMdnsDiscovery(options) {
     const localProfile = options.profilePublicKey.toLowerCase();
@@ -81,6 +77,9 @@ export function createMdnsDiscovery(options) {
                     return;
                 }
                 if (!isFriendProfile(parsed.profilePublicKey)) {
+                    return;
+                }
+                if (!shouldInitiateSyncTcp(localProfile, parsed.profilePublicKey)) {
                     return;
                 }
                 const host = service.addresses.find((a) => !a.includes(':')) ?? service.addresses[0];
