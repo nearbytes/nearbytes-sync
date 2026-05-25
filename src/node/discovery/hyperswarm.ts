@@ -1,12 +1,18 @@
 import Hyperswarm from 'hyperswarm';
+import { Socket } from 'net';
 import type { DuplexPeer } from '../../core/peerLoop.js';
 import type { DiscoveredPeer, PeerDiscovery } from '../../discovery/types.js';
+import { logSyncError } from '../../logSyncError.js';
+import { duplexFromTcpSocket } from '../netDuplex.js';
 
 function duplexFromSocket(socket: {
   on(event: string, cb: (...args: unknown[]) => void): void;
   write(chunk: Uint8Array): void;
   end(): void;
 }): DuplexPeer {
+  if (socket instanceof Socket) {
+    return duplexFromTcpSocket(socket);
+  }
   const handlers = new Set<(chunk: Uint8Array) => void>();
   const closeHandlers = new Set<() => void>();
   socket.on('data', (buf: unknown) => {
@@ -16,8 +22,8 @@ function duplexFromSocket(socket: {
       handler(chunk);
     }
   });
-  socket.on('error', () => {
-    /* keep sync session alive; transport may reset under dual-peer load */
+  socket.on('error', (err: unknown) => {
+    logSyncError('hyperswarm socket', err);
   });
   socket.on('close', () => {
     for (const handler of closeHandlers) {
@@ -26,7 +32,11 @@ function duplexFromSocket(socket: {
   });
   return {
     write: (chunk) => socket.write(chunk),
-    onData: (cb) => handlers.add(cb),
+    onData: (cb) => {
+      handlers.add(cb);
+      return () => handlers.delete(cb);
+    },
+    setBulkInbound: undefined,
     close: () => socket.end(),
     onClose: (cb) => closeHandlers.add(cb),
   };
@@ -40,7 +50,9 @@ export function createHyperswarmDiscovery(topics: readonly Uint8Array[]): PeerDi
     if (!peerHandler) {
       return;
     }
-    socket.on('error', () => {});
+    socket.on('error', (err: unknown) => {
+      logSyncError(`hyperswarm peer:${peerInfo.publicKey.toString('hex').slice(0, 12)}`, err);
+    });
     const duplex = duplexFromSocket(socket);
     peerHandler({
       transport: 'duplex',

@@ -26,24 +26,28 @@ export function exchangeFriendHandshake(
   let remoteProfile: string | null = null;
   let localHelloSent = false;
 
-  const tryComplete = (
-    resolve: (pk: string) => void,
-    reject: (err: Error) => void,
-    clearTimer: () => void,
-  ): void => {
-    if (localHelloSent && remoteProfile !== null) {
-      clearTimer();
-      resolve(remoteProfile);
-    }
-  };
-
   return new Promise((resolve, reject) => {
+    let stopHandshakeData: (() => void) | null = null;
     const timeout = setTimeout(() => {
+      stopHandshakeData?.();
       peer.close();
       reject(new Error('sync handshake timed out'));
     }, options.timeoutMs ?? 15_000);
 
     const clearTimer = (): void => clearTimeout(timeout);
+
+    const detachHandshake = (): void => {
+      stopHandshakeData?.();
+      stopHandshakeData = null;
+    };
+
+    const tryComplete = (): void => {
+      if (localHelloSent && remoteProfile !== null) {
+        detachHandshake();
+        clearTimer();
+        resolve(remoteProfile);
+      }
+    };
 
     const sendHello = (): void => {
       const hello: SyncMessage = {
@@ -55,7 +59,7 @@ export function exchangeFriendHandshake(
       };
       peer.write(encodeFrame(hello));
       localHelloSent = true;
-      tryComplete(resolve, reject, clearTimer);
+      tryComplete();
     };
 
     const onMessage = (msg: SyncMessage): void => {
@@ -63,12 +67,14 @@ export function exchangeFriendHandshake(
         return;
       }
       if (msg.protocol !== PROTOCOL) {
+        detachHandshake();
         clearTimer();
         peer.close();
         reject(new Error(`sync handshake: unsupported protocol ${msg.protocol}`));
         return;
       }
       if (seenNonces.has(msg.sessionNonce)) {
+        detachHandshake();
         clearTimer();
         peer.close();
         reject(new Error('sync handshake: duplicate sessionNonce'));
@@ -78,16 +84,17 @@ export function exchangeFriendHandshake(
 
       const remote = msg.senderProfile?.toLowerCase();
       if (!remote || !options.allowedRemoteProfiles.has(remote)) {
+        detachHandshake();
         clearTimer();
         peer.close();
         reject(new Error('sync handshake: remote is not a configured friend'));
         return;
       }
       remoteProfile = remote;
-      tryComplete(resolve, reject, clearTimer);
+      tryComplete();
     };
 
-    peer.onData(createFrameDecoder(onMessage));
+    stopHandshakeData = peer.onData(createFrameDecoder(onMessage));
     sendHello();
   });
 }

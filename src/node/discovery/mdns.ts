@@ -13,22 +13,18 @@ import {
 } from '../../discovery/lanProfile.js';
 import type { DuplexPeer } from '../../core/peerLoop.js';
 import type { DiscoveredPeer, PeerDiscovery } from '../../discovery/types.js';
+import { logSyncError } from '../../logSyncError.js';
+import { duplexFromTcpSocket } from '../netDuplex.js';
+import { shouldInitiateSyncTcp } from '../tcpBulk.js';
 
 const LAN_MULTICAST_ANNOUNCE_MS_LOCAL = LAN_MULTICAST_ANNOUNCE_MS;
 
 function duplexFromNetSocket(socket: Socket): DuplexPeer {
-  const handlers = new Set<(chunk: Uint8Array) => void>();
-  socket.on('data', (buf: Buffer) => {
-    const chunk = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-    for (const handler of handlers) {
-      handler(chunk);
-    }
+  const peer = duplexFromTcpSocket(socket);
+  socket.on('error', (err) => {
+    logSyncError(`mdns-tcp:${socket.remoteAddress}:${socket.remotePort}`, err);
   });
-  return {
-    write: (chunk) => socket.write(chunk),
-    onData: (cb) => handlers.add(cb),
-    close: () => socket.destroy(),
-  };
+  return peer;
 }
 
 export function createMdnsDiscovery(options: {
@@ -106,6 +102,9 @@ export function createMdnsDiscovery(options: {
           return;
         }
         if (!isFriendProfile(parsed.profilePublicKey)) {
+          return;
+        }
+        if (!shouldInitiateSyncTcp(localProfile, parsed.profilePublicKey)) {
           return;
         }
         const host = service.addresses.find((a: string) => !a.includes(':')) ?? service.addresses[0];

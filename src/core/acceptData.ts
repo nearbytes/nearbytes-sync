@@ -15,17 +15,26 @@ export async function acceptData(
   log: Log,
   ref: ObjectRef,
   bytes: Uint8Array,
+  options?: { verifyIntegrity?: boolean },
 ): Promise<AcceptResult> {
   if (ref.kind === 'block') {
-    const validation = await validateBlockBytes(ref.hash, bytes);
-    if (!validation.ok) {
-      return 'invalid';
-    }
     const hash = ref.hash as Hash;
     if (await log.blocks.has(hash)) {
       return 'duplicate';
     }
-    await log.blocks.store(hash, bytes as EncryptedData, true);
+    if (options?.verifyIntegrity !== false) {
+      const validation = await validateBlockBytes(ref.hash, bytes);
+      if (!validation.ok) {
+        return 'invalid';
+      }
+    }
+    // Streaming receiver: the digest is verified (either above via
+    // `validateBlockBytes`, or incrementally inside the block stream sink
+    // when `verifyIntegrity: false`). Either way the caller asserts that
+    // `hash === SHA-256(bytes)`, so we take the log's fast path that skips
+    // the second hash. See nearbytes-specs/storage/log-api-v1.md §2.3 and
+    // requirements/sync-protocol-v1.md SYNC-36.
+    await log.blocks.storeAlreadyVerified(hash, bytes as EncryptedData, true);
     return 'stored';
   }
 

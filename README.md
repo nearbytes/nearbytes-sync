@@ -1,6 +1,6 @@
 # nearbytes-sync
 
-Friend-to-friend sync (Hyperswarm + mDNS, `nearbytes.sync.v1`). Reactive `have`/`want` on open associations — no timer-driven delta polling.
+Friend-to-friend sync (Hyperswarm + mDNS, `nearbytes.sync.v1`). Reactive `have`/`want` on open associations — no timer-driven delta polling. Block transfer uses **length-prefixed binary frames** (no base64/JSON wrapping of ciphertext).
 
 Normative requirements: `nearbytes-specs/requirements/sync-discovery-v1.md`, `sync-protocol-v1.md`.
 
