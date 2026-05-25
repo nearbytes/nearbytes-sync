@@ -5,7 +5,9 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "exports": {
     ".": {
       "import": "./dist/index.js",
@@ -23,7 +25,7 @@
   "scripts": {
     "build": "tsc",
     "type-check": "tsc --noEmit",
-    "prepare": "tsc"
+    "postinstall": "tsc"
   },
   "license": "MIT",
   "engines": {
