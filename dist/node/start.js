@@ -9,7 +9,7 @@ import { patchLogForReactiveHave } from '../core/sessionRegistry.js';
 import { logSyncError } from '../logSyncError.js';
 import { exchangeFriendHandshake } from '../core/handshake.js';
 import { FriendSessionRegistry } from '../core/friendSessions.js';
-import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
+import { configureHashWorkerPoolCapacity, createNodeDiskBlockStreamFactory } from './blockReceive.js';
 function normalizeFriendSet(friends) {
     const set = new Set();
     for (const pk of friends) {
@@ -19,6 +19,9 @@ function normalizeFriendSet(friends) {
 }
 export async function start(log, friends, options = {}) {
     patchLogForReactiveHave(log);
+    if (options.hashWorkerPoolCapacity !== undefined) {
+        configureHashWorkerPoolCapacity(options.hashWorkerPoolCapacity);
+    }
     const friendSet = normalizeFriendSet(friends);
     const localProfile = options.serveProfilePublicKey?.toLowerCase();
     if (!localProfile) {

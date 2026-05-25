@@ -6,6 +6,12 @@ export interface StartOptions {
     readonly blockStorageRoot?: string;
     /** `mdns` = LAN TCP only (max throughput on localhost). Default `all` (mDNS + Hyperswarm). */
     readonly discoveryTransport?: 'mdns' | 'all';
+    /**
+     * Upper bound on simultaneously-active inbound block hashes in this process.
+     * Defaults to `os.availableParallelism()`. Must be configured before the
+     * first inbound block stream is received.
+     */
+    readonly hashWorkerPoolCapacity?: number;
 }
 export interface SyncHandle {
     readonly friends: readonly string[];

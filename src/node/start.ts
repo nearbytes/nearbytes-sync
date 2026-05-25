@@ -11,7 +11,7 @@ import { patchLogForReactiveHave } from '../core/sessionRegistry.js';
 import { logSyncError } from '../logSyncError.js';
 import { exchangeFriendHandshake } from '../core/handshake.js';
 import { FriendSessionRegistry } from '../core/friendSessions.js';
-import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
+import { configureHashWorkerPoolCapacity, createNodeDiskBlockStreamFactory } from './blockReceive.js';
 
 export interface StartOptions {
   /** Join this profile subject so followers can sync with you (your public key hex). */
@@ -20,6 +20,12 @@ export interface StartOptions {
   readonly blockStorageRoot?: string;
   /** `mdns` = LAN TCP only (max throughput on localhost). Default `all` (mDNS + Hyperswarm). */
   readonly discoveryTransport?: 'mdns' | 'all';
+  /**
+   * Upper bound on simultaneously-active inbound block hashes in this process.
+   * Defaults to `os.availableParallelism()`. Must be configured before the
+   * first inbound block stream is received.
+   */
+  readonly hashWorkerPoolCapacity?: number;
 }
 
 export interface SyncHandle {
@@ -41,6 +47,10 @@ export async function start(
   options: StartOptions = {},
 ): Promise<SyncHandle> {
   patchLogForReactiveHave(log);
+
+  if (options.hashWorkerPoolCapacity !== undefined) {
+    configureHashWorkerPoolCapacity(options.hashWorkerPoolCapacity);
+  }
 
   const friendSet = normalizeFriendSet(friends);
   const localProfile = options.serveProfilePublicKey?.toLowerCase();

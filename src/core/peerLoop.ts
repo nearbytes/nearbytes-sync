@@ -547,12 +547,23 @@ export function attachPeerSession(
       const sink = diskBlockStream.create(hash, total);
       incoming = { mode: 'disk', hash, total, sink };
       // Fast path: bypass ingestStreamBytes; the sink is the only consumer here.
+      // The exclusive-inbound stream can deliver a chunk that crosses the
+      // stream boundary (i.e. last bytes of this stream + the next frame).
+      // We pass only the in-stream bytes to the sink and re-dispatch any
+      // leftover through the wire decoder so the codec returns to control
+      // mode without losing the next `block-stream-begin` frame.
       const directDiskIngest = (chunk: Uint8Array): void => {
-        sink.ingest(chunk);
+        const remaining = total - sink.received;
+        const chunkLen = chunk.byteLength;
+        const take = remaining < chunkLen ? remaining : chunkLen;
+        sink.ingest(take === chunkLen ? chunk : chunk.subarray(0, take));
         if (sink.received >= total) {
           void finishIncomingStream().catch((err) =>
             logSyncError('finishIncomingStream', err),
           );
+          if (take < chunkLen) {
+            decodeControl(chunk.subarray(take));
+          }
         }
       };
       if (peer.setExclusiveInbound) {
