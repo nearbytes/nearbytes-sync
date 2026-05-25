@@ -1,0 +1,1 @@
+{"version":3,"file":"blockReceive.d.ts","sourceRoot":"","sources":["../../src/node/blockReceive.ts"],"names":[],"mappings":"AAMA,OAAO,KAAK,EAEV,mBAAmB,EACnB,0BAA0B,EAC3B,MAAM,qBAAqB,CAAC;AAwO7B,wBAAgB,yBAAyB,CACvC,OAAO,EAAE,MAAM,EACf,IAAI,EAAE,MAAM,EACZ,KAAK,EAAE,MAAM,GACZ,mBAAmB,CAErB;AAED,wBAAgB,gCAAgC,CAAC,OAAO,EAAE,MAAM,GAAG,0BAA0B,CAI5F"}
