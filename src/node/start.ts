@@ -14,8 +14,10 @@ import { FriendSessionRegistry } from '../core/friendSessions.js';
 import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
 
 export interface StartOptions {
-  /** Join this profile subject so followers can sync with you (your public key hex). */
-  readonly serveProfilePublicKey?: string;
+  /** Lower-case hex profile public keys this node serves; see `requirements/sync-protocol-v1.md` SYNC-00. */
+  readonly serveProfilePublicKeys?: readonly string[];
+  /** The served profile used as initiator/follower identity per `sync-discovery-v1.md` DISC-12/24. MUST be in `serveProfilePublicKeys`. */
+  readonly activeProfilePublicKey?: string;
   /** Log data directory (`…/data`) for fs block streaming (Node). */
   readonly blockStorageRoot?: string;
   /** `mdns` = LAN TCP only (max throughput on localhost). Default `all` (mDNS + Hyperswarm). */
@@ -24,12 +26,13 @@ export interface StartOptions {
 
 export interface SyncHandle {
   readonly friends: readonly string[];
+  readonly serveProfilePublicKeys: readonly string[];
   stop(): Promise<void>;
 }
 
-function normalizeFriendSet(friends: readonly string[]): Set<string> {
+function normalizeKeySet(keys: readonly string[]): Set<string> {
   const set = new Set<string>();
-  for (const pk of friends) {
+  for (const pk of keys) {
     set.add(pk.toLowerCase());
   }
   return set;
@@ -42,34 +45,48 @@ export async function start(
 ): Promise<SyncHandle> {
   patchLogForReactiveHave(log);
 
-  const friendSet = normalizeFriendSet(friends);
-  const localProfile = options.serveProfilePublicKey?.toLowerCase();
-  if (!localProfile) {
-    throw new Error('friend carriage requires serveProfilePublicKey (configure profileSecret)');
+  const friendSet = normalizeKeySet(friends);
+  const servedSet = normalizeKeySet(options.serveProfilePublicKeys ?? []);
+  if (servedSet.size === 0) {
+    throw new Error('friend carriage requires at least one served profile (configure profiles[])');
+  }
+  const activeProfile =
+    options.activeProfilePublicKey?.toLowerCase() ?? [...servedSet][0]!;
+  if (!servedSet.has(activeProfile)) {
+    throw new Error('activeProfilePublicKey must be one of serveProfilePublicKeys');
   }
 
-  const marker = `nearbytes-sync start ${new Date().toISOString()} friends=${friends.length} serve=yes`;
+  const marker = `nearbytes-sync start ${new Date().toISOString()} friends=${friends.length} serve=${servedSet.size} active=${activeProfile.slice(0, 12)}`;
   await log.sync.appendMarker(marker);
 
   const topics: Uint8Array[] = [];
   const topicHexes = new Set<string>();
+  const topicToAssociationProfile = new Map<string, string>();
 
-  const addTopic = async (subject: ReturnType<typeof profileSubject>): Promise<void> => {
+  const addTopicForProfile = async (profile: string): Promise<void> => {
+    const subject = profileSubject(profile);
     const topic = await syncTopic(subject);
     const hex = Buffer.from(topic).toString('hex');
     if (!topicHexes.has(hex)) {
       topicHexes.add(hex);
       topics.push(topic);
+      topicToAssociationProfile.set(hex, profile);
     }
   };
 
-  for (const pk of friends) {
-    await addTopic(profileSubject(pk));
+  for (const lp of servedSet) {
+    await addTopicForProfile(lp);
   }
-  await addTopic(profileSubject(localProfile));
+  for (const f of friendSet) {
+    await addTopicForProfile(f);
+  }
 
   if (topics.length === 0 || friendSet.size === 0) {
-    return { friends, async stop() {} };
+    return {
+      friends,
+      serveProfilePublicKeys: [...servedSet],
+      async stop() {},
+    };
   }
 
   const peerId = randomBytes(16).toString('hex');
@@ -80,21 +97,35 @@ export async function start(
   const backends = [
     createMdnsDiscovery({
       peerId,
-      profilePublicKey: localProfile,
+      localProfilePublicKeys: [...servedSet],
+      activeProfilePublicKey: activeProfile,
       friendProfileKeys: friendSet,
     }),
   ];
   if (transport === 'all') {
-    backends.unshift(createHyperswarmDiscovery(topics));
+    backends.unshift(
+      createHyperswarmDiscovery({
+        topics,
+        topicToAssociationProfile,
+        fallbackAssociationProfile: activeProfile,
+      }),
+    );
   }
   const discovery = createCompositeDiscovery(backends);
 
   const friendSessions = new FriendSessionRegistry();
-  const connectingFriends = new Set<string>();
+  const connectingPairs = new Set<string>();
 
-  const openFriendAssociation = (discovered: DiscoveredPeer, expectedRemote?: string): void => {
+  const openFriendAssociation = (
+    discovered: DiscoveredPeer,
+    associationProfile: string,
+    expectedRemote?: string,
+  ): void => {
+    const localProfileForAssoc = servedSet.has(associationProfile)
+      ? associationProfile
+      : activeProfile;
+    let remoteHint = expectedRemote?.toLowerCase();
     void (async () => {
-      let remoteHint = expectedRemote?.toLowerCase();
       try {
         const duplex = await connectDiscoveredPeer(discovered);
         if (remoteHint !== undefined && !friendSet.has(remoteHint)) {
@@ -103,17 +134,18 @@ export async function start(
         }
 
         const remoteProfile = await exchangeFriendHandshake(duplex, {
-          localProfilePublicKey: localProfile,
-          subject: profileSubject(remoteHint ?? localProfile),
+          localProfilePublicKey: localProfileForAssoc,
+          subject: profileSubject(associationProfile),
           allowedRemoteProfiles: friendSet,
         });
         remoteHint = remoteProfile;
 
-        if (connectingFriends.has(remoteProfile)) {
+        const pairKey = `${localProfileForAssoc}:${remoteProfile}`;
+        if (connectingPairs.has(pairKey)) {
           duplex.close();
           return;
         }
-        connectingFriends.add(remoteProfile);
+        connectingPairs.add(pairKey);
 
         await appendBenchMarker(log, 'peer-connected', {
           transport: discovered.transport,
@@ -136,39 +168,45 @@ export async function start(
         if (created) {
           await appendBenchMarker(log, 'friend-session-attached', {
             remote: remoteProfile.slice(0, 16),
+            localProfile: localProfileForAssoc.slice(0, 16),
           });
         }
 
-        connectingFriends.delete(remoteProfile);
+        connectingPairs.delete(pairKey);
       } catch (err) {
         logSyncError(`friend-connect:${discovered.label}`, err);
         if (remoteHint !== undefined) {
-          connectingFriends.delete(remoteHint);
+          connectingPairs.delete(`${localProfileForAssoc}:${remoteHint}`);
         }
       }
     })();
   };
 
   discovery.onPeer((discovered) => {
+    const association =
+      discovered.transport === 'tcp'
+        ? discovered.associationProfile
+        : discovered.associationProfile ?? activeProfile;
     if (discovered.transport === 'tcp') {
       if (!friendSet.has(discovered.profilePublicKey)) {
         return;
       }
-      openFriendAssociation(discovered, discovered.profilePublicKey);
+      openFriendAssociation(discovered, association!, discovered.profilePublicKey);
       return;
     }
-    openFriendAssociation(discovered);
+    openFriendAssociation(discovered, association!);
   });
 
   await discovery.start();
   await appendBenchMarker(log, 'discovery-started', {
     topics: topics.length,
     friends: friends.length,
-    serve: 1,
+    serve: servedSet.size,
   });
 
   return {
     friends,
+    serveProfilePublicKeys: [...servedSet],
     async stop(): Promise<void> {
       friendSessions.closeAll();
       await discovery.stop();

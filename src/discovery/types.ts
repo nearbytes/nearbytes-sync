@@ -1,6 +1,15 @@
 import type { DuplexPeer } from '../core/peerLoop.js';
 
-/** Normalized peer endpoint from any discovery backend. */
+/**
+ * Normalized peer endpoint from any discovery backend.
+ *
+ * `associationProfile` is the lower-case hex profile public key whose sync
+ * topic produced this connection — see `requirements/sync-protocol-v1.md`
+ * SYNC-07 and `requirements/sync-discovery-v1.md` DISC-12/24. Per SYNC-00 a
+ * node may serve $K \ge 0$ local profiles; `associationProfile` is what
+ * lets the upper layer decide which local profile to authenticate as for
+ * this specific connection.
+ */
 export type DiscoveredPeer =
   | {
       readonly transport: 'duplex';
@@ -8,6 +17,8 @@ export type DiscoveredPeer =
       readonly connect: () => Promise<DuplexPeer>;
       /** Set when discovery already knows the remote profile key (e.g. mDNS TXT). */
       readonly profilePublicKey?: string;
+      /** Profile owning the topic this connection is on (lower-case hex). */
+      readonly associationProfile?: string;
     }
   | {
       readonly transport: 'tcp';
@@ -15,6 +26,8 @@ export type DiscoveredPeer =
       readonly host: string;
       readonly port: number;
       readonly profilePublicKey: string;
+      /** Profile owning the topic this connection is on (lower-case hex). */
+      readonly associationProfile: string;
     };
 
 export interface PeerDiscovery {
