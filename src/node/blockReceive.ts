@@ -1,9 +1,8 @@
 import { close, mkdirSync, open, write } from 'node:fs';
 import { rename, unlink } from 'node:fs/promises';
-import { availableParallelism } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { Hash, HashWorkerPool, StreamingHasher } from 'nearbytes-crypto';
-import { createHashWorkerPool } from 'nearbytes-crypto';
+import type { Hash, Sha256Stream } from 'nearbytes-crypto';
+import { acquireSha256Stream } from 'nearbytes-crypto';
 import { blockPath } from 'nearbytes-log';
 import type {
   DiskBlockStreamFinishResult,
@@ -21,43 +20,6 @@ import type {
  * optimal.
  */
 const BATCH_BYTES = 4 << 20;
-
-/**
- * Process-wide pool of long-lived streaming SHA-256 workers. Sized to the host
- * core count by default; a single pool serves every association so K
- * simultaneously-finalizing block streams reuse K warm workers without paying
- * any spawn cost. The pool is created lazily on the first inbound block stream
- * so non-sync consumers of `nearbytes-sync` do not eagerly spawn workers.
- *
- * The pool's capacity is the upper bound on inbound block streams that hash
- * concurrently in this process. Additional acquires queue on the pool's FIFO
- * and resume as workers release.
- */
-let hashPool: HashWorkerPool | null = null;
-let hashPoolCapacity: number = Math.max(2, availableParallelism());
-
-export function configureHashWorkerPoolCapacity(capacity: number): void {
-  if (!Number.isInteger(capacity) || capacity < 1) {
-    throw new Error(`hash worker pool capacity must be a positive integer, got ${capacity}`);
-  }
-  if (hashPool) {
-    throw new Error('hash worker pool already initialized; configure before first inbound stream');
-  }
-  hashPoolCapacity = capacity;
-}
-
-function getHashPool(): HashWorkerPool {
-  if (!hashPool) {
-    hashPool = createHashWorkerPool({ capacity: hashPoolCapacity });
-  }
-  return hashPool;
-}
-
-export async function shutdownHashWorkerPool(): Promise<void> {
-  const p = hashPool;
-  hashPool = null;
-  if (p) await p.close();
-}
 
 function openWriteAsync(path: string): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -78,19 +40,20 @@ function writeFdAsync(fd: number, buf: Buffer, length: number, position: number)
 }
 
 /**
- * Async fs.write queue + pooled worker-thread sha256.
+ * Async fs.write queue + off-thread streaming sha256.
  *
  * Wire bytes are pushed in three directions for each chunk:
- *  - copied into a 4 MiB hash batch buffer, transferred to a pooled streaming
- *    hasher when full
+ *  - copied into a 4 MiB hash batch buffer, transferred to a streaming
+ *    sha256 hasher (off-main-thread via `acquireSha256Stream`) when full
  *  - enqueued as a parallel pwrite (fs.write with explicit position) on the
  *    tmp fd
  *  - counted toward the stream total
  *
- * The hash worker, the parallel writes, and the rename all complete
- * asynchronously, so the wall clock is wire + max(drain, hashTail) + rename.
- * When K block streams are in flight simultaneously, each one holds an
- * independent worker from the pool, so K SHA-256s run in parallel on K cores.
+ * The hash, the parallel writes, and the rename all complete asynchronously,
+ * so the wall clock is wire + max(drain, hashTail) + rename. The streaming
+ * hasher is transparently dispatched to one of K long-lived worker threads
+ * managed inside `nearbytes-crypto`; when K block streams finalize at once,
+ * K SHA-256s run on K cores in parallel.
  */
 function createAsyncSink(dataDir: string, hash: string, total: number): DiskBlockStreamSink {
   const finalPath = join(dataDir, blockPath(hash as Hash));
@@ -109,14 +72,14 @@ function createAsyncSink(dataDir: string, hash: string, total: number): DiskBloc
   });
 
   /**
-   * The pool acquire is async; chunks may arrive before the worker is
-   * checked out. We buffer them as transferable `ArrayBuffer`s and drain on
-   * arrival, then continue streaming straight through. In the steady state
-   * the pool is pre-warmed and acquire resolves in a single microtask, so
+   * The streaming hasher acquire is async; chunks may arrive before the
+   * worker is checked out. We buffer them as transferable `ArrayBuffer`s
+   * and drain on arrival, then continue streaming straight through. In
+   * the steady state the acquire resolves in a single microtask, so
    * `pendingChunks` rarely holds more than one batch.
    */
-  const hasherPromise: Promise<StreamingHasher> = getHashPool().acquire();
-  let hasher: StreamingHasher | null = null;
+  const hasherPromise: Promise<Sha256Stream> = acquireSha256Stream();
+  let hasher: Sha256Stream | null = null;
   const pendingChunks: ArrayBuffer[] = [];
   let finalizeRequested = false;
   let digestResolve: ((hex: string) => void) | null = null;
@@ -126,7 +89,7 @@ function createAsyncSink(dataDir: string, hash: string, total: number): DiskBloc
     digestReject = reject;
   });
 
-  const driveHasher = (h: StreamingHasher): void => {
+  const driveHasher = (h: Sha256Stream): void => {
     for (const chunk of pendingChunks) {
       h.updateTransfer(chunk);
     }
