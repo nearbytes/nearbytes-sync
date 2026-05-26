@@ -1,4 +1,6 @@
 import { randomBytes } from 'crypto';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import type { Log } from 'nearbytes-log';
 import { profileSubject, syncTopic } from '../core/topic.js';
 import { createCompositeDiscovery } from '../discovery/composite.js';
@@ -36,6 +38,74 @@ function normalizeKeySet(keys: readonly string[]): Set<string> {
     set.add(pk.toLowerCase());
   }
   return set;
+}
+
+const NODE_ID_FILENAME = '.nearbytes-node-id';
+const DATADIR_LOCK_FILENAME = '.nearbytes-sync.lock';
+const NODE_ID_RE = /^[0-9a-f]{32}$/;
+
+/**
+ * Returns the per-`dataDir` node identity used to filter sibling loopback
+ * (`sync-discovery-v1.md` DISC-26). Two processes that share the same
+ * `dataDir` are the *same* node and MUST NOT see each other as siblings;
+ * persisting the id under the directory makes "same storage = same node"
+ * the unambiguous loopback predicate, independent of OS process identity.
+ *
+ * For purely in-memory deployments (`dataDir` undefined) we fall back to a
+ * per-process random id so the discovery layer still has something to key
+ * loopback by, accepting that two such processes can never collide on
+ * storage anyway.
+ */
+function loadOrCreateNodeId(dataDir: string | undefined): string {
+  if (dataDir === undefined) return randomBytes(16).toString('hex');
+  mkdirSync(dataDir, { recursive: true });
+  const file = join(dataDir, NODE_ID_FILENAME);
+  if (existsSync(file)) {
+    const existing = readFileSync(file, 'utf8').trim().toLowerCase();
+    if (NODE_ID_RE.test(existing)) return existing;
+  }
+  const fresh = randomBytes(16).toString('hex');
+  writeFileSync(file, fresh, { encoding: 'utf8', flag: 'wx' });
+  return fresh;
+}
+
+/**
+ * Refuses a second `start()` against the same `dataDir`. Two writers on a
+ * single append-only log corrupt it, regardless of the sibling-sync layer's
+ * behaviour. We take a tiny exclusive flag file as a coarse advisory lock
+ * and release it from the returned `stop()` handle. Lock is best-effort:
+ * if the previous process crashed without releasing, the caller can delete
+ * the lock file manually (its content names the holding pid).
+ */
+function acquireDataDirLock(dataDir: string | undefined): () => void {
+  if (dataDir === undefined) return () => {};
+  mkdirSync(dataDir, { recursive: true });
+  const lockPath = join(dataDir, DATADIR_LOCK_FILENAME);
+  let fd: number;
+  try {
+    fd = openSync(lockPath, 'wx');
+  } catch (err) {
+    const holder = existsSync(lockPath) ? readFileSync(lockPath, 'utf8').trim() : '(unknown)';
+    throw new Error(
+      `nearbytes-sync: dataDir ${dataDir} is already in use by ${holder} (lock at ${lockPath}). ` +
+        `Stop the other process or remove the stale lock file.`,
+    );
+  }
+  writeFileSync(fd, `${process.pid}\n`, 'utf8');
+  closeSync(fd);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    try {
+      const onDisk = readFileSync(lockPath, 'utf8').trim();
+      if (onDisk === String(process.pid)) {
+        unlinkSync(lockPath);
+      }
+    } catch {
+      // best-effort
+    }
+  };
 }
 
 export async function start(
@@ -94,7 +164,12 @@ export async function start(
     };
   }
 
-  const peerId = randomBytes(16).toString('hex');
+  const releaseDataDirLock = acquireDataDirLock(options.blockStorageRoot);
+  // `peerId` here is the dataDir-derived node identity (DISC-26 loopback
+  // key). Stable across process restarts; collides only when two processes
+  // genuinely share the same on-disk log — which is also caught by the
+  // dataDir lock above and therefore never reaches this point in practice.
+  const peerId = loadOrCreateNodeId(options.blockStorageRoot);
   const authorizedRemoteProfiles = new Set<string>([...servedSet, ...friendSet]);
   // Default to mDNS+Hyperswarm so peers find each other across both LAN and
   // WAN out of the box. Benchmarks that want LAN-only TCP for max throughput
@@ -220,7 +295,12 @@ export async function start(
     openFriendAssociation(discovered, association!);
   });
 
-  await discovery.start();
+  try {
+    await discovery.start();
+  } catch (err) {
+    releaseDataDirLock();
+    throw err;
+  }
   await appendBenchMarker(log, 'discovery-started', {
     topics: topics.length,
     friends: friends.length,
@@ -234,6 +314,7 @@ export async function start(
       friendSessions.closeAll();
       await discovery.stop();
       await log.sync.appendMarker(`nearbytes-sync stop ${new Date().toISOString()}`);
+      releaseDataDirLock();
     },
   };
 }
