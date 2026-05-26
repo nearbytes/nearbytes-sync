@@ -134,6 +134,16 @@ function inertHandle(): SyncHandle {
     peers: () => [],
     onEvent: () => () => {},
     recentEvents: () => [],
+    stats: () => ({
+      totalBytesIn: 0,
+      totalBytesOut: 0,
+      totalBlocksIn: 0,
+      totalBlocksOut: 0,
+      totalEventsIn: 0,
+      bytesPerSecIn: 0,
+      bytesPerSecOut: 0,
+      windowMs: 5_000,
+    }),
     stop: async () => {},
   };
 }

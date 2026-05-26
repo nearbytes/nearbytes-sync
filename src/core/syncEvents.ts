@@ -191,3 +191,134 @@ export class SyncEventBuffer {
     return this.buf.length;
   }
 }
+
+// ── cumulative + windowed statistics ─────────────────────────────────────
+
+/**
+ * Process-lifetime totals plus a short-window throughput estimate.
+ *
+ * Totals are simple monotonic counters since `start()` ran. Throughput
+ * is computed over a sliding window (5 s by default) so transient
+ * spikes are smoothed but the figure still reacts within a few seconds
+ * to a peer joining or leaving — what an `htop`-style display needs.
+ *
+ * The two `bytesPerSec*` fields are inferred at query time from the
+ * underlying sample buffer; they are not a separately maintained
+ * counter, so a long quiet period naturally decays the rate to zero
+ * without an explicit "reset on idle" path.
+ */
+export interface SyncStats {
+  /** Bytes received across all kinds (blocks + events) since start. */
+  readonly totalBytesIn: number;
+  readonly totalBytesOut: number;
+  readonly totalBlocksIn: number;
+  readonly totalBlocksOut: number;
+  /** Profile-log events received and stored (events, not blocks). */
+  readonly totalEventsIn: number;
+  /** Bytes-per-second over the last `windowMs` (default 5 000). */
+  readonly bytesPerSecIn: number;
+  readonly bytesPerSecOut: number;
+  /**
+   * Window length used to compute the rate, surfaced so UIs can label
+   * the figure honestly ("over last 5 s") instead of pretending it is
+   * instantaneous.
+   */
+  readonly windowMs: number;
+}
+
+const DEFAULT_BANDWIDTH_WINDOW_MS = 5_000;
+/**
+ * Hard cap on the sample retention window. We keep at most twice the
+ * default rate window so that a `.rate(longer)` call is bounded but
+ * still useful. Samples older than this are pruned at insertion time.
+ */
+const BANDWIDTH_RETENTION_MS = 2 * DEFAULT_BANDWIDTH_WINDOW_MS;
+
+/**
+ * Cumulative counters + sliding-window byte rates. Self-contained so
+ * unit tests can drive it directly without standing up a full sync
+ * stack.
+ *
+ * Implementation notes:
+ *
+ *  - Each `record()` appends a single `(at, bytesIn, bytesOut)`
+ *    sample and prunes anything outside the retention window. Pruning
+ *    is amortised O(1) per call because samples leave the head of the
+ *    array in chronological order.
+ *
+ *  - `snapshot()` is the only externally visible read path. It is the
+ *    place where the rate window length is materialised, so callers
+ *    cannot accidentally observe an inconsistent (totals,rate) pair.
+ */
+export class SyncStatsAccumulator {
+  private bytesIn = 0;
+  private bytesOut = 0;
+  private blocksIn = 0;
+  private blocksOut = 0;
+  private eventsIn = 0;
+  /**
+   * Newest-last sliding sample log: each entry contributes to the
+   * windowed rate. `bytesIn`/`bytesOut` track per-sample deltas (NOT
+   * cumulative) so the rate is simply sum-divided-by-window.
+   */
+  private readonly samples: Array<{ at: number; in: number; out: number }> = [];
+
+  constructor(private readonly windowMs = DEFAULT_BANDWIDTH_WINDOW_MS) {}
+
+  /**
+   * Record a block-sent event. Updates the outbound totals and the
+   * sliding sample log. `bytes` MUST be non-negative; zero-byte
+   * blocks are a contract violation upstream (a block-sent event
+   * always carries the bytes that hit the wire).
+   */
+  recordBlockSent(bytes: number): void {
+    this.bytesOut += bytes;
+    this.blocksOut += 1;
+    this.recordSample(0, bytes);
+  }
+
+  recordBlockReceived(bytes: number): void {
+    this.bytesIn += bytes;
+    this.blocksIn += 1;
+    this.recordSample(bytes, 0);
+  }
+
+  recordEventReceived(bytes: number): void {
+    this.bytesIn += bytes;
+    this.eventsIn += 1;
+    this.recordSample(bytes, 0);
+  }
+
+  private recordSample(bytesInDelta: number, bytesOutDelta: number): void {
+    const now = Date.now();
+    this.samples.push({ at: now, in: bytesInDelta, out: bytesOutDelta });
+    const cutoff = now - BANDWIDTH_RETENTION_MS;
+    while (this.samples.length > 0 && this.samples[0]!.at < cutoff) {
+      this.samples.shift();
+    }
+  }
+
+  snapshot(): SyncStats {
+    const now = Date.now();
+    const start = now - this.windowMs;
+    let bin = 0;
+    let bout = 0;
+    for (const s of this.samples) {
+      if (s.at >= start) {
+        bin += s.in;
+        bout += s.out;
+      }
+    }
+    const seconds = this.windowMs / 1000;
+    return {
+      totalBytesIn: this.bytesIn,
+      totalBytesOut: this.bytesOut,
+      totalBlocksIn: this.blocksIn,
+      totalBlocksOut: this.blocksOut,
+      totalEventsIn: this.eventsIn,
+      bytesPerSecIn: bin / seconds,
+      bytesPerSecOut: bout / seconds,
+      windowMs: this.windowMs,
+    };
+  }
+}

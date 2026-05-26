@@ -19,7 +19,9 @@ import { acquireSyncLock } from './dataDirLock.js';
 import {
   SyncEventBuffer,
   SyncEventBus,
+  SyncStatsAccumulator,
   type SyncEvent,
+  type SyncStats,
 } from '../core/syncEvents.js';
 
 export interface StartOptions {
@@ -122,6 +124,15 @@ export interface SyncHandle {
    * waiting for new traffic.
    */
   recentEvents(): readonly SyncEvent[];
+  /**
+   * Cumulative counters (since `start()` ran) plus a short-window
+   * throughput estimate. Used by the monitor UI to render bandwidth
+   * (KB/s) and lifetime totals (blocks/events/bytes transferred).
+   * The window length is part of the returned struct so the UI can
+   * label the figure honestly ("over last 5 s") rather than imply
+   * instantaneous-ness.
+   */
+  stats(): SyncStats;
   stop(): Promise<void>;
 }
 
@@ -217,6 +228,16 @@ export async function start(
       peers: () => [],
       onEvent: () => () => {},
       recentEvents: () => [],
+      stats: () => ({
+        totalBytesIn: 0,
+        totalBytesOut: 0,
+        totalBlocksIn: 0,
+        totalBlocksOut: 0,
+        totalEventsIn: 0,
+        bytesPerSecIn: 0,
+        bytesPerSecOut: 0,
+        windowMs: 5_000,
+      }),
       async stop() {},
     };
   }
@@ -262,6 +283,28 @@ export async function start(
   const eventBus = new SyncEventBus();
   const eventBuffer = new SyncEventBuffer();
   eventBus.onEvent((e) => eventBuffer.push(e));
+
+  // Cumulative + windowed throughput counters. Driven by the same bus
+  // as the ring buffer so a UI does not need a second subscription;
+  // `sync.stats()` simply queries this accumulator at render time.
+  const statsAccumulator = new SyncStatsAccumulator();
+  eventBus.onEvent((e) => {
+    switch (e.kind) {
+      case 'block-sent':
+        statsAccumulator.recordBlockSent(e.bytes);
+        break;
+      case 'block-received':
+        statsAccumulator.recordBlockReceived(e.bytes);
+        break;
+      case 'event-received':
+        statsAccumulator.recordEventReceived(e.bytes);
+        break;
+      case 'peer-connected':
+      case 'peer-disconnected':
+        // Peer transitions do not move bytes; nothing to accumulate.
+        break;
+    }
+  });
 
   const friendSessions = new FriendSessionRegistry(eventBus);
   const connectingPairs = new Set<string>();
@@ -417,6 +460,7 @@ export async function start(
       })),
     onEvent: (handler) => eventBus.onEvent(handler),
     recentEvents: () => eventBuffer.recent(),
+    stats: () => statsAccumulator.snapshot(),
     async stop(): Promise<void> {
       /**
        * Teardown contract: every step is best-effort and the dataDir lock

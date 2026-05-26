@@ -38,7 +38,7 @@
 import { unlink, writeFile, rename, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ConnectedPeer, SyncHandle, SyncSnapshot } from './start.js';
-import type { SyncEvent } from '../core/syncEvents.js';
+import type { SyncEvent, SyncStats } from '../core/syncEvents.js';
 
 export const STATE_BEACON_FILENAME = '.nearbytes-sync.state.json';
 export const STATE_BEACON_TMP_SUFFIX = '.nearbytes-sync.state.tmp';
@@ -73,6 +73,13 @@ export interface SyncStateBeaconPayload {
    * format them with no conversion drift relative to a live consumer.
    */
   readonly events?: readonly SyncEvent[];
+  /**
+   * Cumulative + windowed throughput counters from
+   * `SyncHandle.stats()`. Optional: older daemons that predate the
+   * stats accumulator omit it, and readers MUST treat absence as
+   * zeroed counters (not as an error).
+   */
+  readonly stats?: SyncStats;
 }
 
 export interface StateBeaconHandle {
@@ -117,6 +124,7 @@ export function startStateBeacon(opts: {
         role: p.role,
       })),
       events: opts.sync.recentEvents(),
+      stats: opts.sync.stats(),
     };
   };
 
@@ -232,6 +240,15 @@ export async function readSyncStateBeacon(dataDir: string): Promise<ReadBeaconRe
   // so its absence is fine; presence with the wrong shape is a hard reject
   // because rendering garbage events would be worse than rendering none.
   if (payload.events !== undefined && !Array.isArray(payload.events)) {
+    return null;
+  }
+  // Same back-compat policy for `stats`: optional, but if present it
+  // must be an object (we do not deep-validate every numeric field
+  // because the renderer already coerces sane defaults).
+  if (
+    payload.stats !== undefined &&
+    (typeof payload.stats !== 'object' || payload.stats === null)
+  ) {
     return null;
   }
   const updatedAtMs = Date.parse(payload.updatedAt);

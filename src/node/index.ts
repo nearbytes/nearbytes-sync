@@ -13,6 +13,7 @@ export {
   type BlockSentEvent,
   type BlockReceivedEvent,
   type EventReceivedEvent,
+  type SyncStats,
 } from '../core/syncEvents.js';
 export {
   readSyncStateBeacon,
