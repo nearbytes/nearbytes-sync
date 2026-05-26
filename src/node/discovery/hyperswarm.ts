@@ -5,6 +5,15 @@ import type { DiscoveredPeer, PeerDiscovery } from '../../discovery/types.js';
 import { logPeerSocketError } from '../../logSyncError.js';
 import { duplexFromTcpSocket } from '../netDuplex.js';
 
+/**
+ * NOTE: socket `'error'` is intentionally NOT handled here — the
+ * `Hyperswarm.on('connection')` listener in `createHyperswarmDiscovery`
+ * already installs an error handler with the richer `peer:<pubkey>`
+ * scope. Installing a second handler here would double every log line
+ * for the hyperswarm transport (one with `peer:<hex>` and one with the
+ * generic `socket` scope), which is the source of the duplicated
+ * `connection timed out` spam observed in the REPL.
+ */
 function duplexFromSocket(socket: {
   on(event: string, cb: (...args: unknown[]) => void): void;
   write(chunk: Uint8Array): void;
@@ -21,9 +30,6 @@ function duplexFromSocket(socket: {
     for (const handler of handlers) {
       handler(chunk);
     }
-  });
-  socket.on('error', (err: unknown) => {
-    logPeerSocketError('hyperswarm socket', err);
   });
   socket.on('close', () => {
     for (const handler of closeHandlers) {
