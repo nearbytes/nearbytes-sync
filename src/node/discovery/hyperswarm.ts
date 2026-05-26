@@ -115,7 +115,39 @@ export function createHyperswarmDiscovery(options: {
       peerHandler = handler;
     },
     async stop(): Promise<void> {
-      await swarm.destroy();
+      /**
+       * `Hyperswarm.destroy()` performs DHT `leave` RPCs against every topic
+       * we joined and waits for ACKs from bootstrap nodes; that wait is
+       * unbounded in practice — we have observed it block indefinitely when
+       * peers were flaky or the local DHT routing table was being torn down
+       * mid-handshake. The CLI shutdown contract is that
+       * `SyncHandle.stop()` returns in bounded time so the dataDir lock can
+       * be released; we honour that contract here by racing destroy against
+       * a hard budget and abandoning the DHT leaves on timeout.
+       *
+       * Abandoning leaves is safe: the network already treats every peer
+       * disconnect (graceful or not) the same way — DHT entries time out
+       * server-side, and any open transport sockets are closed by the OS
+       * when the process exits. The only cost of timing out here is one
+       * less informative leave RPC; correctness is unaffected.
+       */
+      const DESTROY_BUDGET_MS = 3000;
+      let timer: NodeJS.Timeout | null = null;
+      const timeout = new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          process.stderr.write(
+            `[nearbytes-sync:hyperswarm] swarm.destroy() did not finish within ` +
+              `${DESTROY_BUDGET_MS}ms; abandoning DHT leaves and continuing shutdown\n`,
+          );
+          resolve();
+        }, DESTROY_BUDGET_MS);
+        timer.unref();
+      });
+      try {
+        await Promise.race([swarm.destroy(), timeout]);
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
     },
   };
 }

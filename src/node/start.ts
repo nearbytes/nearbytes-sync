@@ -293,9 +293,31 @@ export async function start(
       inflightOutbound: outbound.size(),
     }),
     async stop(): Promise<void> {
-      friendSessions.closeAll();
-      await discovery.stop();
-      await log.sync.appendMarker(`nearbytes-sync stop ${new Date().toISOString()}`);
+      /**
+       * Teardown contract: every step is best-effort and the dataDir lock
+       * MUST be released no matter what. The lock represents our claim on
+       * the storage root; leaving it behind on partial failure would force
+       * the next start to take the stale-lock recovery path, which is
+       * correct but ugly. We therefore run each step in isolation and
+       * release the lock in a `finally`.
+       */
+      try {
+        friendSessions.closeAll();
+      } catch (err) {
+        process.stderr.write(
+          `[nearbytes-sync] friendSessions.closeAll failed: ${String(err)}\n`,
+        );
+      }
+      try {
+        await discovery.stop();
+      } catch (err) {
+        process.stderr.write(`[nearbytes-sync] discovery.stop failed: ${String(err)}\n`);
+      }
+      try {
+        await log.sync.appendMarker(`nearbytes-sync stop ${new Date().toISOString()}`);
+      } catch {
+        /* best-effort marker; not a correctness boundary */
+      }
       releaseDataDirLock();
     },
   };
