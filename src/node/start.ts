@@ -14,6 +14,7 @@ import { logSyncError } from '../logSyncError.js';
 import { exchangeFriendHandshake } from '../core/handshake.js';
 import { FriendSessionRegistry } from '../core/friendSessions.js';
 import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
+import { inflightBlockRegistry, outboundBlockStreamCounter } from '../core/inflightBlocks.js';
 
 export interface StartOptions {
   /** Lower-case hex profile public keys this node serves; see `requirements/sync-protocol-v1.md` SYNC-00. */
@@ -26,9 +27,22 @@ export interface StartOptions {
   readonly discoveryTransport?: 'mdns' | 'all';
 }
 
+export interface SyncSnapshot {
+  /** Block hashes for which a `want` is outstanding (incoming streams not yet finished). */
+  readonly inflightInbound: number;
+  /** Block stream pumps currently queued or running on the outbound wire chain. */
+  readonly inflightOutbound: number;
+}
+
 export interface SyncHandle {
   readonly friends: readonly string[];
   readonly serveProfilePublicKeys: readonly string[];
+  /**
+   * Point-in-time view of sync activity, used by CLIs to implement a clean
+   * `bye`/`quit` flush ("wait until quiet before exiting"). Cheap to call:
+   * just reads two counters on the per-Log inflight registries.
+   */
+  snapshot(): SyncSnapshot;
   stop(): Promise<void>;
 }
 
@@ -205,6 +219,7 @@ export async function start(
     return {
       friends,
       serveProfilePublicKeys: [...servedSet],
+      snapshot: () => ({ inflightInbound: 0, inflightOutbound: 0 }),
       async stop() {},
     };
   }
@@ -352,9 +367,15 @@ export async function start(
     serve: servedSet.size,
   });
 
+  const inbound = inflightBlockRegistry(log);
+  const outbound = outboundBlockStreamCounter(log);
   return {
     friends,
     serveProfilePublicKeys: [...servedSet],
+    snapshot: (): SyncSnapshot => ({
+      inflightInbound: inbound.size(),
+      inflightOutbound: outbound.size(),
+    }),
     async stop(): Promise<void> {
       friendSessions.closeAll();
       await discovery.stop();

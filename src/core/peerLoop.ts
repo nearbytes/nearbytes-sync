@@ -15,7 +15,7 @@ import type { ObjectRef, Subject, SyncMessage } from './types.js';
 import { appendBenchMarker } from '../benchMarker.js';
 import { logSyncError } from '../logSyncError.js';
 import { registerLocalHaveAnnouncer, type LocalHaveAnnouncer } from './sessionRegistry.js';
-import { inflightBlockRegistry } from './inflightBlocks.js';
+import { inflightBlockRegistry, outboundBlockStreamCounter } from './inflightBlocks.js';
 
 /** In-memory RX buffer limit per block stream (512 MiB). */
 const MAX_BLOCK_STREAM_BUFFER_BYTES = 512 * 1024 * 1024;
@@ -158,6 +158,8 @@ function sendBlockStream(
   bytes: Uint8Array | null,
   totalBytes: number,
 ): void {
+  const outboundCounter = outboundBlockStreamCounter(log);
+  outboundCounter.begin();
   runOutbound(async () => {
     try {
       let pumped: { bytes: number; pumpBeginAt: number; pumpEndAt: number } | null = null;
@@ -194,6 +196,8 @@ function sendBlockStream(
       }
     } catch (err) {
       logSyncError(`sendBlockStream:${ref.hash.slice(0, 16)}`, err);
+    } finally {
+      outboundCounter.end();
     }
   });
 }

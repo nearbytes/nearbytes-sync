@@ -31,6 +31,44 @@ export class InflightBlockRegistry {
   release(hash: string): void {
     this.inflight.delete(hash.toLowerCase());
   }
+
+  /** Number of hashes currently in flight (for `bye`-time quiesce snapshots). */
+  size(): number {
+    return this.inflight.size;
+  }
+}
+
+/**
+ * Per-Log counter of outbound block-stream pumps currently in `runOutbound`
+ * across all open associations. Tracked here (not inside `attachPeerSession`)
+ * so a snapshot caller can aggregate the whole Log without enumerating
+ * sessions. Mutated by `sendBlockStream` on enqueue/completion.
+ */
+export class OutboundBlockStreamCounter {
+  private count = 0;
+
+  begin(): void {
+    this.count += 1;
+  }
+
+  end(): void {
+    if (this.count > 0) this.count -= 1;
+  }
+
+  size(): number {
+    return this.count;
+  }
+}
+
+const outbound = new WeakMap<Log, OutboundBlockStreamCounter>();
+
+export function outboundBlockStreamCounter(log: Log): OutboundBlockStreamCounter {
+  let c = outbound.get(log);
+  if (c === undefined) {
+    c = new OutboundBlockStreamCounter();
+    outbound.set(log, c);
+  }
+  return c;
 }
 
 const registries = new WeakMap<Log, InflightBlockRegistry>();
