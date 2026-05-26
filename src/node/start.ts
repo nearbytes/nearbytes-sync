@@ -81,7 +81,12 @@ export async function start(
     await addTopicForProfile(f);
   }
 
-  if (topics.length === 0 || friendSet.size === 0) {
+  // Discovery starts whenever we have at least one topic to advertise on,
+  // which is true whenever we serve at least one profile (DISC-10). An
+  // empty friend list is no longer a no-op: per `sync-discovery-v1.md`
+  // DISC-26, sibling devices that share a served profile MUST be able to
+  // discover and sync with each other without any friend setup.
+  if (topics.length === 0) {
     return {
       friends,
       serveProfilePublicKeys: [...servedSet],
@@ -90,6 +95,7 @@ export async function start(
   }
 
   const peerId = randomBytes(16).toString('hex');
+  const authorizedRemoteProfiles = new Set<string>([...servedSet, ...friendSet]);
   // Default to mDNS+Hyperswarm so peers find each other across both LAN and
   // WAN out of the box. Benchmarks that want LAN-only TCP for max throughput
   // (no Noise encryption, no UDX framing) explicitly opt out by setting
@@ -128,28 +134,37 @@ export async function start(
     const localProfileForAssoc = servedSet.has(associationProfile)
       ? associationProfile
       : activeProfile;
-    let remoteHint = expectedRemote?.toLowerCase();
+    let remoteProfileHint = expectedRemote?.toLowerCase();
+    let pairKeyOptimistic: string | null = null;
     void (async () => {
       try {
         const duplex = await connectDiscoveredPeer(discovered);
-        if (remoteHint !== undefined && !friendSet.has(remoteHint)) {
+        if (
+          remoteProfileHint !== undefined &&
+          !authorizedRemoteProfiles.has(remoteProfileHint)
+        ) {
           duplex.close();
           return;
         }
 
-        const remoteProfile = await exchangeFriendHandshake(duplex, {
+        const { remoteProfile, remotePeerId } = await exchangeFriendHandshake(duplex, {
           localProfilePublicKey: localProfileForAssoc,
+          localPeerId: peerId,
           subject: profileSubject(associationProfile),
-          allowedRemoteProfiles: friendSet,
+          allowedRemoteProfiles: authorizedRemoteProfiles,
         });
-        remoteHint = remoteProfile;
+        remoteProfileHint = remoteProfile;
 
-        const pairKey = `${localProfileForAssoc}:${remoteProfile}`;
+        // Pair key now includes the remote peerId so two sibling devices
+        // (same profile, different peerId, DISC-26) each get their own
+        // connecting-pair slot and can run in parallel.
+        const pairKey = `${localProfileForAssoc}:${remoteProfile}:${remotePeerId}`;
         if (connectingPairs.has(pairKey)) {
           duplex.close();
           return;
         }
         connectingPairs.add(pairKey);
+        pairKeyOptimistic = pairKey;
 
         await appendBenchMarker(log, 'peer-connected', {
           transport: discovered.transport,
@@ -160,6 +175,7 @@ export async function start(
         const { created } = friendSessions.attach(
           log,
           remoteProfile,
+          remotePeerId,
           duplex,
           {
             blockStorageRoot: storageRoot,
@@ -172,15 +188,18 @@ export async function start(
         if (created) {
           await appendBenchMarker(log, 'friend-session-attached', {
             remote: remoteProfile.slice(0, 16),
+            remotePeerId: remotePeerId.slice(0, 16),
             localProfile: localProfileForAssoc.slice(0, 16),
+            sibling: remoteProfile === localProfileForAssoc,
           });
         }
 
         connectingPairs.delete(pairKey);
+        pairKeyOptimistic = null;
       } catch (err) {
         logSyncError(`friend-connect:${discovered.label}`, err);
-        if (remoteHint !== undefined) {
-          connectingPairs.delete(`${localProfileForAssoc}:${remoteHint}`);
+        if (pairKeyOptimistic !== null) {
+          connectingPairs.delete(pairKeyOptimistic);
         }
       }
     })();
@@ -192,7 +211,7 @@ export async function start(
         ? discovered.associationProfile
         : discovered.associationProfile ?? activeProfile;
     if (discovered.transport === 'tcp') {
-      if (!friendSet.has(discovered.profilePublicKey)) {
+      if (!authorizedRemoteProfiles.has(discovered.profilePublicKey)) {
         return;
       }
       openFriendAssociation(discovered, association!, discovered.profilePublicKey);

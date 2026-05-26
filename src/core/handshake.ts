@@ -7,23 +7,37 @@ const PROTOCOL = 'nearbytes.sync.v1' as const;
 
 export interface FriendHandshakeOptions {
   readonly localProfilePublicKey: string;
+  readonly localPeerId: string;
   readonly subject: Subject;
+  /**
+   * Set of remote profile public keys (lower-case hex) we accept as the
+   * remote peer's claimed identity. Per `sync-discovery-v1.md` DISC-24 this
+   * is the union of served local profiles (sibling carriage, DISC-26) and
+   * configured friends (friend carriage).
+   */
   readonly allowedRemoteProfiles: ReadonlySet<string>;
   readonly timeoutMs?: number;
 }
 
+export interface FriendHandshakeResult {
+  readonly remoteProfile: string;
+  /** Empty string when the remote did not advertise a peerId (pre-DISC-26 peer). */
+  readonly remotePeerId: string;
+}
+
 /**
  * Exchanges {@code hello} on a new duplex before anti-entropy.
- * Resolves with the verified remote profile public key (lower-case hex).
+ * Resolves with the verified remote profile public key and per-process peerId.
  */
 export function exchangeFriendHandshake(
   peer: DuplexPeer,
   options: FriendHandshakeOptions,
-): Promise<string> {
+): Promise<FriendHandshakeResult> {
   const localProfile = options.localProfilePublicKey.toLowerCase();
+  const localPeerId = options.localPeerId.toLowerCase();
   const sessionNonce = randomBytes(16).toString('hex');
   const seenNonces = new Set<string>();
-  let remoteProfile: string | null = null;
+  let remoteResult: FriendHandshakeResult | null = null;
   let localHelloSent = false;
 
   return new Promise((resolve, reject) => {
@@ -42,10 +56,10 @@ export function exchangeFriendHandshake(
     };
 
     const tryComplete = (): void => {
-      if (localHelloSent && remoteProfile !== null) {
+      if (localHelloSent && remoteResult !== null) {
         detachHandshake();
         clearTimer();
-        resolve(remoteProfile);
+        resolve(remoteResult);
       }
     };
 
@@ -56,6 +70,7 @@ export function exchangeFriendHandshake(
         subject: options.subject,
         sessionNonce,
         senderProfile: localProfile,
+        senderPeerId: localPeerId,
       };
       peer.write(encodeFrame(hello));
       localHelloSent = true;
@@ -87,10 +102,18 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
-        reject(new Error('sync handshake: remote is not a configured friend'));
+        reject(new Error('sync handshake: remote is not an authorized profile'));
         return;
       }
-      remoteProfile = remote;
+      const remotePeerId = msg.senderPeerId?.toLowerCase() ?? '';
+      if (remote === localProfile && remotePeerId === localPeerId) {
+        detachHandshake();
+        clearTimer();
+        peer.close();
+        reject(new Error('sync handshake: process-level loopback'));
+        return;
+      }
+      remoteResult = { remoteProfile: remote, remotePeerId };
       tryComplete();
     };
 

@@ -11,9 +11,28 @@ const SLICE = BLOCK_STREAM_WRITE_SLICE_BYTES;
 /** Files at/under this size are read fully into memory before writing to the socket. */
 const SMALL_FILE_INLINE_BYTES = 256 * 1024 * 1024;
 
-/** Lower profile hex initiates outbound TCP (one session per friend pair). */
-export function shouldInitiateSyncTcp(localProfileHex: string, remoteProfileHex: string): boolean {
-  return localProfileHex.toLowerCase() < remoteProfileHex.toLowerCase();
+/**
+ * Decides which side dials TCP for an LAN-discovered peer.
+ *
+ * For cross-identity friend pairs (`local.profile != remote.profile`) the
+ * lower profile hex dials (same rule as before). For same-identity sibling
+ * pairs (`local.profile == remote.profile`, `sync-discovery-v1.md` DISC-26)
+ * profile equality cannot break the tie, so we fall through to the
+ * `peerId` lex order, which is always distinct because `peerId` is a
+ * per-process random 16-byte hex string.
+ */
+export function shouldInitiateSyncTcp(
+  localProfileHex: string,
+  remoteProfileHex: string,
+  localPeerId: string,
+  remotePeerId: string,
+): boolean {
+  const localProfile = localProfileHex.toLowerCase();
+  const remoteProfile = remoteProfileHex.toLowerCase();
+  if (localProfile !== remoteProfile) {
+    return localProfile < remoteProfile;
+  }
+  return localPeerId.toLowerCase() < remotePeerId.toLowerCase();
 }
 
 export interface PumpResult {

@@ -58,8 +58,10 @@ export function createMdnsDiscovery(options: {
   let multicastTimer: ReturnType<typeof setInterval> | null = null;
   const seenTcp = new Set<string>();
 
-  const isFriendProfile = (profilePublicKey: string): boolean =>
-    options.friendProfileKeys.has(profilePublicKey.toLowerCase());
+  const isAuthorizedRemoteProfile = (profilePublicKey: string): boolean => {
+    const key = profilePublicKey.toLowerCase();
+    return options.friendProfileKeys.has(key) || localProfileSet.has(key);
+  };
 
   const startListenerForProfile = async (profile: string): Promise<{ server: Server; port: number }> => {
     const server = createServer((socket) => {
@@ -125,17 +127,19 @@ export function createMdnsDiscovery(options: {
         if (!parsed || parsed.alpn !== LAN_TRANSPORT_PROFILE_ID) {
           return;
         }
-        if (parsed.peerId === options.peerId || localProfileSet.has(parsed.profilePublicKey)) {
+        if (parsed.peerId === options.peerId) {
           return;
         }
-        if (!isFriendProfile(parsed.profilePublicKey)) {
+        if (!isAuthorizedRemoteProfile(parsed.profilePublicKey)) {
           return;
         }
-        if (!shouldInitiateSyncTcp(activeProfile, parsed.profilePublicKey)) {
+        const isSibling = localProfileSet.has(parsed.profilePublicKey);
+        const dialAsProfile = isSibling ? parsed.profilePublicKey : activeProfile;
+        if (!shouldInitiateSyncTcp(dialAsProfile, parsed.profilePublicKey, options.peerId, parsed.peerId)) {
           return;
         }
         const host = service.addresses.find((a: string) => !a.includes(':')) ?? service.addresses[0];
-        const key = `${parsed.profilePublicKey}:${host}:${parsed.syncPort}`;
+        const key = `${parsed.profilePublicKey}:${parsed.peerId}:${host}:${parsed.syncPort}`;
         if (seenTcp.has(key)) {
           return;
         }
@@ -147,6 +151,7 @@ export function createMdnsDiscovery(options: {
           port: parsed.syncPort,
           profilePublicKey: parsed.profilePublicKey,
           associationProfile: parsed.profilePublicKey,
+          remotePeerId: parsed.peerId,
         });
       });
 

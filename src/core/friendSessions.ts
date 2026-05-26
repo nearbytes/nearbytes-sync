@@ -4,6 +4,8 @@ import { profileSubject } from './topic.js';
 
 export interface FriendSessionEntry {
   readonly remoteProfilePublicKey: string;
+  /** Empty string for legacy peers that did not advertise a peerId (pre-DISC-26). */
+  readonly remotePeerId: string;
   readonly transportLabel: string;
   readonly stop: () => void;
   close(): void;
@@ -22,21 +24,30 @@ function transportPreference(label: string): number {
 }
 
 /**
- * One active framed sync association per remote friend profile key (SYNC-06).
- * Duplicate inbound connections are dropped so Hyperswarm flaps do not replace a live mDNS session.
+ * Sessions are keyed by `(remoteProfile, remotePeerId)` (`sync-discovery-v1.md`
+ * DISC-26) so two sibling devices that share the same identity each get their
+ * own session entry. Duplicate connections to the **same** sibling are still
+ * deduped: a higher-preference transport (mDNS TCP) wins over a lower one.
  */
 export class FriendSessionRegistry {
   private readonly sessions = new Map<string, FriendSessionEntry>();
 
+  private sessionKey(remoteProfile: string, remotePeerId: string): string {
+    return `${remoteProfile.toLowerCase()}|${remotePeerId.toLowerCase()}`;
+  }
+
   attach(
     log: Log,
     remoteProfilePublicKey: string,
+    remotePeerId: string,
     peer: DuplexPeer,
     sessionOptions: AttachPeerSessionOptions = {},
     transportLabel = 'unknown',
   ): { readonly entry: FriendSessionEntry; readonly created: boolean } {
     const remote = remoteProfilePublicKey.toLowerCase();
-    const existing = this.sessions.get(remote);
+    const remotePid = remotePeerId.toLowerCase();
+    const key = this.sessionKey(remote, remotePid);
+    const existing = this.sessions.get(key);
     if (existing !== undefined && existing.isAlive()) {
       if (transportPreference(transportLabel) >= transportPreference(existing.transportLabel)) {
         peer.close();
@@ -44,12 +55,12 @@ export class FriendSessionRegistry {
       }
       existing.stop();
       existing.close();
-      this.sessions.delete(remote);
+      this.sessions.delete(key);
     }
     if (existing !== undefined) {
       existing.stop();
       existing.close();
-      this.sessions.delete(remote);
+      this.sessions.delete(key);
     }
 
     const subject = profileSubject(remote);
@@ -57,18 +68,19 @@ export class FriendSessionRegistry {
     let entry: FriendSessionEntry;
     const stop = attachPeerSession(log, subject, peer, () => {
       alive = false;
-      if (this.sessions.get(remote) === entry) {
-        this.sessions.delete(remote);
+      if (this.sessions.get(key) === entry) {
+        this.sessions.delete(key);
       }
     }, sessionOptions);
     entry = {
       remoteProfilePublicKey: remote,
+      remotePeerId: remotePid,
       transportLabel,
       stop,
       close: () => peer.close(),
       isAlive: () => alive,
     };
-    this.sessions.set(remote, entry);
+    this.sessions.set(key, entry);
     return { entry, created: true };
   }
 
