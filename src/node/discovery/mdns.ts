@@ -13,7 +13,7 @@ import {
 } from '../../discovery/lanProfile.js';
 import type { DuplexPeer } from '../../core/peerLoop.js';
 import type { DiscoveredPeer, PeerDiscovery } from '../../discovery/types.js';
-import { logSyncError } from '../../logSyncError.js';
+import { logPeerSocketError } from '../../logSyncError.js';
 import { duplexFromTcpSocket } from '../netDuplex.js';
 import { shouldInitiateSyncTcp } from '../tcpBulk.js';
 
@@ -22,7 +22,7 @@ const LAN_MULTICAST_ANNOUNCE_MS_LOCAL = LAN_MULTICAST_ANNOUNCE_MS;
 function duplexFromNetSocket(socket: Socket): DuplexPeer {
   const peer = duplexFromTcpSocket(socket);
   socket.on('error', (err) => {
-    logSyncError(`mdns-tcp:${socket.remoteAddress}:${socket.remotePort}`, err);
+    logPeerSocketError(`mdns-tcp:${socket.remoteAddress}:${socket.remotePort}`, err);
   });
   return peer;
 }

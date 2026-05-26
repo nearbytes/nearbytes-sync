@@ -2,7 +2,7 @@ import Hyperswarm from 'hyperswarm';
 import { Socket } from 'net';
 import type { DuplexPeer } from '../../core/peerLoop.js';
 import type { DiscoveredPeer, PeerDiscovery } from '../../discovery/types.js';
-import { logSyncError } from '../../logSyncError.js';
+import { logPeerSocketError } from '../../logSyncError.js';
 import { duplexFromTcpSocket } from '../netDuplex.js';
 
 function duplexFromSocket(socket: {
@@ -23,7 +23,7 @@ function duplexFromSocket(socket: {
     }
   });
   socket.on('error', (err: unknown) => {
-    logSyncError('hyperswarm socket', err);
+    logPeerSocketError('hyperswarm socket', err);
   });
   socket.on('close', () => {
     for (const handler of closeHandlers) {
@@ -87,7 +87,7 @@ export function createHyperswarmDiscovery(options: {
         return;
       }
       socket.on('error', (err: unknown) => {
-        logSyncError(`hyperswarm peer:${peerInfo.publicKey.toString('hex').slice(0, 12)}`, err);
+        logPeerSocketError(`hyperswarm peer:${peerInfo.publicKey.toString('hex').slice(0, 12)}`, err);
       });
       const duplex = duplexFromSocket(socket);
       peerHandler({

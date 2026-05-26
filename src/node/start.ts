@@ -10,7 +10,7 @@ import { createHyperswarmDiscovery } from './discovery/hyperswarm.js';
 import { createMdnsDiscovery } from './discovery/mdns.js';
 import { appendBenchMarker } from '../benchMarker.js';
 import { patchLogForReactiveHave } from '../core/sessionRegistry.js';
-import { logSyncError } from '../logSyncError.js';
+import { logSyncError, logPeerSocketError } from '../logSyncError.js';
 import { exchangeFriendHandshake } from '../core/handshake.js';
 import { FriendSessionRegistry } from '../core/friendSessions.js';
 import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
@@ -332,7 +332,7 @@ export async function start(
         connectingPairs.delete(pairKey);
         pairKeyOptimistic = null;
       } catch (err) {
-        logSyncError(`friend-connect:${discovered.label}`, err);
+        logPeerSocketError(`friend-connect:${discovered.label}`, err);
         if (pairKeyOptimistic !== null) {
           connectingPairs.delete(pairKeyOptimistic);
         }
