@@ -12,7 +12,7 @@
  * are operator misconfigurations the daemon MUST not paper over.
  */
 
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -117,13 +117,53 @@ const EMPTY_CONFIG: SyncDaemonConfig = {
 };
 
 /**
+ * Refuse to load the config file if its POSIX permissions allow anyone
+ * other than the owning user to read or write it. The config contains
+ * profile (and volume) secrets in cleartext — those strings ARE the inputs
+ * to `crypto.deriveKeys`, so a group- or world-readable file (which is
+ * what the default `umask 022` produces) is a credential leak: any local
+ * user could read the file and sync as that profile.
+ *
+ * This mirrors `nearbytes-skeleton`'s `assertSecureConfigPermissions`; we
+ * duplicate the function rather than import it to keep `nearbytes-sync`
+ * free of an upstream skeleton dependency (skeleton already depends on
+ * sync, so importing back would create a cycle).
+ *
+ * Windows has no POSIX-mode equivalent we can rely on (ACLs are out of
+ * scope here), so the check no-ops there.
+ *
+ * To fix on an existing install: `chmod 600 ~/.nearbytes/config.json`.
+ */
+async function assertSecureConfigPermissions(filePath: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  const st = await stat(filePath);
+  const euid = process.geteuid?.();
+  if (euid !== undefined && st.uid !== euid) {
+    throw new Error(
+      `nbsync: config file ${filePath} is owned by UID ${st.uid} (not your UID ${euid}). ` +
+        `Refusing to load — config contains profile/volume secrets in cleartext.`,
+    );
+  }
+  if ((st.mode & 0o077) !== 0) {
+    const octal = (st.mode & 0o777).toString(8).padStart(3, '0');
+    throw new Error(
+      `nbsync: config file ${filePath} is group/world-accessible (mode ${octal}). ` +
+        `Refusing to load — config contains profile/volume secrets in cleartext. ` +
+        `Run: chmod 600 ${filePath}`,
+    );
+  }
+}
+
+/**
  * Read and parse the sync-daemon config file. Missing or empty files are
  * silently accepted (daemon idles); malformed JSON or non-object roots
- * throw with the file path in the message.
+ * throw with the file path in the message. Files with insecure POSIX
+ * permissions are also refused (see `assertSecureConfigPermissions`).
  */
 export async function readDaemonConfig(configPath?: string): Promise<SyncDaemonConfig> {
   const file = configPath ?? defaultDaemonConfigPath();
   if (!existsSync(file)) return EMPTY_CONFIG;
+  await assertSecureConfigPermissions(file);
   let raw: string;
   try {
     raw = await readFile(file, 'utf-8');

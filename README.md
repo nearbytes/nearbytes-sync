@@ -67,3 +67,18 @@ systemd is Linux-only. On macOS, drop the following plist at `~/Library/LaunchAg
 ### Coexistence with the CLI
 
 Per DISC-27 (split form: singleton sync, plural writers), the lock only protects the *sync engine*. Multiple processes MAY write events into the same dataDir simultaneously — content-addressed naming makes that CRDT-trivial, and `nearbytes-log`'s `fsIo.writeFile` publishes via `link(2)` first-wins. The skeleton's `bootSync` checks `probeSyncLock()` and falls back to a writer-only handle when a daemon is active, so the file CLI works alongside the daemon without conflict.
+
+### Config-file permissions
+
+`~/.nearbytes/config.json` contains your profile and volume secrets in cleartext (those strings ARE the inputs to `crypto.deriveKeys`), so the daemon refuses to load it if it's readable by anyone other than you. Concretely:
+
+- `readDaemonConfig()` (called by `nbsync daemon` and `nbsync status`) `stat`s the file and throws if it is not owned by your UID or if its POSIX mode has any group/world bits set (i.e. mode must be `0o600`).
+- `nearbytes-skeleton`'s `writeConfig` always publishes the file atomically at mode `0o600` via unique tmp + rename, so newly-written configs are safe by construction.
+
+If you wrote `~/.nearbytes/config.json` by hand (or were using an older version of these tools that didn't tighten on write), `nbsync daemon` will refuse to start with an error pointing you at the exact fix:
+
+```sh
+chmod 600 ~/.nearbytes/config.json
+```
+
+The check is POSIX-only and no-ops on Windows (where ACLs would be the correct mechanism; out of scope for v1).
