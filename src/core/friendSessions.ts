@@ -7,6 +7,13 @@ export interface FriendSessionEntry {
   /** Empty string for legacy peers that did not advertise a peerId (pre-DISC-26). */
   readonly remotePeerId: string;
   readonly transportLabel: string;
+  /** Wall-clock when the session became alive (after handshake). */
+  readonly connectedAt: Date;
+  /**
+   * Local profile under which this association is run. For sibling carriage
+   * this equals `remoteProfilePublicKey`; for asymmetric follow it differs.
+   */
+  readonly localAssociationProfile: string;
   readonly stop: () => void;
   close(): void;
   isAlive(): boolean;
@@ -57,6 +64,7 @@ export class FriendSessionRegistry {
     peer: DuplexPeer,
     sessionOptions: AttachPeerSessionOptions = {},
     transportLabel = 'unknown',
+    localAssociationProfile = '',
   ): { readonly entry: FriendSessionEntry; readonly created: boolean } {
     const remote = remoteProfilePublicKey.toLowerCase();
     const remotePid = remotePeerId.toLowerCase();
@@ -90,12 +98,27 @@ export class FriendSessionRegistry {
       remoteProfilePublicKey: remote,
       remotePeerId: remotePid,
       transportLabel,
+      connectedAt: new Date(),
+      localAssociationProfile: localAssociationProfile.toLowerCase(),
       stop,
       close: () => peer.close(),
       isAlive: () => alive,
     };
     this.sessions.set(key, entry);
     return { entry, created: true };
+  }
+
+  /**
+   * Frozen snapshot of currently-alive sessions. Used by `SyncHandle.peers()`
+   * so that CLI consumers can render observability views ("where is this
+   * block coming from?") without taking a reference to the live registry.
+   */
+  liveEntries(): readonly FriendSessionEntry[] {
+    const out: FriendSessionEntry[] = [];
+    for (const entry of this.sessions.values()) {
+      if (entry.isAlive()) out.push(entry);
+    }
+    return out;
   }
 
   closeAll(): void {

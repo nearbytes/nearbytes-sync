@@ -1,4 +1,10 @@
-export { start, type SyncHandle, type SyncSnapshot, type StartOptions } from './start.js';
+export {
+  start,
+  type SyncHandle,
+  type SyncSnapshot,
+  type ConnectedPeer,
+  type StartOptions,
+} from './start.js';
 export {
   probeSyncLock,
   SyncAlreadyRunningError,

@@ -43,6 +43,41 @@ export interface SyncSnapshot {
   readonly connectedPeers: number;
 }
 
+export interface ConnectedPeer {
+  /** Profile public key the remote signs under for this association. */
+  readonly remoteProfilePublicKey: string;
+  /**
+   * Stable per-process node identity of the remote (DISC-26). Two sibling
+   * devices that share the same `remoteProfilePublicKey` have different
+   * `remotePeerId`s and each appear as a distinct entry here.
+   */
+  readonly remotePeerId: string;
+  /**
+   * Transport route taken by this association. Examples:
+   *   `mdns-tcp:192.168.1.5:53432` — mDNS-discovered TCP on the LAN
+   *   `mdns:<peerId-prefix>`       — pre-TCP-handshake mDNS sighting
+   *   `hyperswarm:<short-pubkey>`  — DHT-routed, transport is UTP/TCP
+   * The label is exactly what discovery emitted; it is the user-facing
+   * answer to "where did this peer come from?".
+   */
+  readonly transportLabel: string;
+  /**
+   * Local profile under which this association is run. For sibling carriage
+   * (`remoteProfilePublicKey === localAssociationProfile`) the remote is
+   * another device of OURS; for asymmetric follow they differ — we are
+   * tailing somebody else's profile log.
+   */
+  readonly localAssociationProfile: string;
+  /** Wall-clock when the session became alive (post-handshake). */
+  readonly connectedAt: Date;
+  /**
+   * `'sibling'` when `remoteProfilePublicKey` equals
+   * `localAssociationProfile` (same profile = another of our devices),
+   * `'friend'` otherwise.
+   */
+  readonly role: 'sibling' | 'friend';
+}
+
 export interface SyncHandle {
   readonly friends: readonly string[];
   readonly serveProfilePublicKeys: readonly string[];
@@ -52,6 +87,15 @@ export interface SyncHandle {
    * just reads two counters on the per-Log inflight registries.
    */
   snapshot(): SyncSnapshot;
+  /**
+   * Currently-alive sibling/friend sessions. Frozen snapshot — safe to
+   * mutate the returned array; subsequent calls return a fresh list.
+   * Cheap: O(N) over the in-memory session registry, no I/O. Used by
+   * observability commands (`peers`, `monitor`) so the operator can
+   * answer "is this block coming from the daemon next to me, from a
+   * sibling on the LAN, or over the DHT?".
+   */
+  peers(): readonly ConnectedPeer[];
   stop(): Promise<void>;
 }
 
@@ -144,6 +188,7 @@ export async function start(
       friends,
       serveProfilePublicKeys: [...servedSet],
       snapshot: () => ({ inflightInbound: 0, inflightOutbound: 0, connectedPeers: 0 }),
+      peers: () => [],
       async stop() {},
     };
   }
@@ -243,6 +288,7 @@ export async function start(
               : {}),
           },
           discovered.label,
+          localProfileForAssoc,
         );
         if (created) {
           await appendBenchMarker(log, 'friend-session-attached', {
@@ -301,6 +347,19 @@ export async function start(
       inflightOutbound: outbound.size(),
       connectedPeers: friendSessions.aliveCount,
     }),
+    peers: (): readonly ConnectedPeer[] =>
+      friendSessions.liveEntries().map((entry) => ({
+        remoteProfilePublicKey: entry.remoteProfilePublicKey,
+        remotePeerId: entry.remotePeerId,
+        transportLabel: entry.transportLabel,
+        localAssociationProfile: entry.localAssociationProfile,
+        connectedAt: entry.connectedAt,
+        role:
+          entry.localAssociationProfile !== '' &&
+          entry.localAssociationProfile === entry.remoteProfilePublicKey
+            ? ('sibling' as const)
+            : ('friend' as const),
+      })),
     async stop(): Promise<void> {
       /**
        * Teardown contract: every step is best-effort and the dataDir lock
