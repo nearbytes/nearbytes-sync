@@ -15,6 +15,7 @@ import type { ObjectRef, Subject, SyncMessage } from './types.js';
 import { appendBenchMarker } from '../benchMarker.js';
 import { logSyncError } from '../logSyncError.js';
 import { registerLocalHaveAnnouncer, type LocalHaveAnnouncer } from './sessionRegistry.js';
+import { inflightBlockRegistry } from './inflightBlocks.js';
 
 /** In-memory RX buffer limit per block stream (512 MiB). */
 const MAX_BLOCK_STREAM_BUFFER_BYTES = 512 * 1024 * 1024;
@@ -254,6 +255,30 @@ export function attachPeerSession(
     });
   };
 
+  /**
+   * Per-Log inflight block tracker (SYNC: at-most-one `want(H)` across sessions).
+   *
+   * `claimedHashes` mirrors what THIS session currently holds in the registry,
+   * so a session-close can release exactly its own claims without disturbing
+   * slots owned by sibling sessions. Slots are released either when the
+   * incoming stream for that hash completes (any outcome) or on session stop.
+   */
+  const inflight = inflightBlockRegistry(log);
+  const claimedHashes = new Set<string>();
+  const claimBlockWant = (hash: string): boolean => {
+    const key = hash.toLowerCase();
+    if (claimedHashes.has(key)) return true;
+    if (!inflight.claim(key)) return false;
+    claimedHashes.add(key);
+    return true;
+  };
+  const releaseBlockClaim = (hash: string): void => {
+    const key = hash.toLowerCase();
+    if (claimedHashes.delete(key)) {
+      inflight.release(key);
+    }
+  };
+
   const sendHave = async (
     refs: readonly ReceptionObjectRef[],
     more = false,
@@ -320,7 +345,17 @@ export function attachPeerSession(
     }
 
     if (msg.type === 'have') {
-      const wants = await missingRefs(log, msg.objects);
+      const candidates = await missingRefs(log, msg.objects);
+      const wants: ObjectRef[] = [];
+      for (const ref of candidates) {
+        if (ref.kind === 'block') {
+          if (claimBlockWant(ref.hash)) {
+            wants.push(ref);
+          }
+        } else {
+          wants.push(ref);
+        }
+      }
       if (wants.length > 0) {
         sendWants(wants);
       }
@@ -448,6 +483,7 @@ export function attachPeerSession(
     }
     incoming = null;
     clearBulkInbound();
+    releaseBlockClaim(stream.hash);
     if (stream.mode === 'discard') {
       return;
     }
@@ -512,8 +548,7 @@ export function attachPeerSession(
     if (stream.mode === 'discard') {
       stream.received = Math.min(stream.total, stream.received + chunk.byteLength);
       if (stream.received >= stream.total) {
-        incoming = null;
-        clearBulkInbound();
+        void finishIncomingStream().catch((err) => logSyncError('finishIncomingStream', err));
       }
       return;
     }
@@ -612,6 +647,10 @@ export function attachPeerSession(
 
   const stop = (): void => {
     unregister();
+    for (const key of claimedHashes) {
+      inflight.release(key);
+    }
+    claimedHashes.clear();
     onPeerClose?.();
   };
   if (peer.onClose) {

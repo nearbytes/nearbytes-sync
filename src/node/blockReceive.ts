@@ -1,6 +1,7 @@
-import { close, mkdirSync, open, write } from 'node:fs';
+import { close, existsSync, mkdirSync, open, write } from 'node:fs';
 import { rename, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { Hash, Sha256Stream } from 'nearbytes-crypto';
 import { acquireSha256Stream } from 'nearbytes-crypto';
 import { blockPath } from 'nearbytes-log';
@@ -57,7 +58,16 @@ function writeFdAsync(fd: number, buf: Buffer, length: number, position: number)
  */
 function createAsyncSink(dataDir: string, hash: string, total: number): DiskBlockStreamSink {
   const finalPath = join(dataDir, blockPath(hash as Hash));
-  const tmpPath = `${finalPath}.tmp`;
+  /**
+   * Unique scratch path per in-flight stream. Content-addressed blocks are
+   * CRDT-trivial (bytes ARE the hash) so two concurrent deliveries of the
+   * same hash are correct by construction; the only requirement is that
+   * neither writer trashes the other's tmp file. With a stable `.tmp` suffix
+   * both writers shared the same path, causing `O_CREAT|O_TRUNC` to clobber
+   * each other and the second rename to ENOENT once the first stole the
+   * dir entry. A random suffix isolates each stream's scratch space.
+   */
+  const tmpPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`;
   mkdirSync(dirname(finalPath), { recursive: true });
   const fdPromise: Promise<number> = openWriteAsync(tmpPath);
   let received = 0;
@@ -216,7 +226,40 @@ function createAsyncSink(dataDir: string, hash: string, total: number): DiskBloc
         },
       };
     }
-    await rename(tmpPath, finalPath);
+    /**
+     * Idempotent commit. Three race outcomes are all "stored":
+     *  (a) Final path empty → rename succeeds atomically.
+     *  (b) Final path already populated by a concurrent stream → drop our
+     *      verified scratch (same hash, same bytes; CRDT merge is identity).
+     *  (c) Rename loses a race after the existsSync check → POSIX rename
+     *      overwrites atomically with byte-identical content, so success is
+     *      still correctness; ENOENT only happens if our own tmp got unlinked
+     *      out from under us, which is impossible with a unique tmp suffix
+     *      but is tolerated defensively when the final exists.
+     */
+    if (existsSync(finalPath)) {
+      await unlink(tmpPath).catch(() => undefined);
+      return {
+        outcome: 'stored',
+        phases: {
+          firstByteAt,
+          lastByteAt,
+          diskDrainDoneAt,
+          hashDoneAt,
+          renameDoneAt: hashDoneAt,
+        },
+      };
+    }
+    try {
+      await rename(tmpPath, finalPath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if ((code === 'ENOENT' || code === 'EEXIST') && existsSync(finalPath)) {
+        await unlink(tmpPath).catch(() => undefined);
+      } else {
+        throw err;
+      }
+    }
     const renameDoneAt = Date.now();
     return {
       outcome: 'stored',
