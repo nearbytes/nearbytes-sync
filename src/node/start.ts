@@ -70,42 +70,87 @@ function loadOrCreateNodeId(dataDir: string | undefined): string {
 }
 
 /**
+ * Returns true iff `pid` corresponds to a process this OS user can signal.
+ * `process.kill(pid, 0)` performs no signal delivery but still raises
+ * EPERM/ESRCH for missing pids, which is exactly the existence check we
+ * want for stale-lock detection.
+ */
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // EPERM means the process exists but we can't signal it — still alive.
+    return code === 'EPERM';
+  }
+}
+
+function readLockHolder(lockPath: string): { pid: number; raw: string } | null {
+  if (!existsSync(lockPath)) return null;
+  const raw = readFileSync(lockPath, 'utf8').trim();
+  const pid = Number.parseInt(raw, 10);
+  return { pid, raw };
+}
+
+/**
  * Refuses a second `start()` against the same `dataDir`. Two writers on a
  * single append-only log corrupt it, regardless of the sibling-sync layer's
- * behaviour. We take a tiny exclusive flag file as a coarse advisory lock
- * and release it from the returned `stop()` handle. Lock is best-effort:
- * if the previous process crashed without releasing, the caller can delete
- * the lock file manually (its content names the holding pid).
+ * behaviour. Lock semantics:
+ *
+ *   - An exclusive flag file (`O_EXCL`) under `dataDir` stores the holder's
+ *     pid; a second `start()` whose holder pid is still alive fails fast
+ *     with a message naming it.
+ *   - If the holder pid is dead, the lock is considered stale (the previous
+ *     process crashed without unlinking), so we silently replace it.
+ *   - The returned function releases the lock; we also register a
+ *     `process.on('exit')` hook so a clean Node shutdown unlinks the file
+ *     even if the caller forgot to `stop()`.
  */
 function acquireDataDirLock(dataDir: string | undefined): () => void {
   if (dataDir === undefined) return () => {};
   mkdirSync(dataDir, { recursive: true });
   const lockPath = join(dataDir, DATADIR_LOCK_FILENAME);
-  let fd: number;
+
+  const takeLock = (): void => {
+    const fd = openSync(lockPath, 'wx');
+    writeFileSync(fd, `${process.pid}\n`, 'utf8');
+    closeSync(fd);
+  };
+
   try {
-    fd = openSync(lockPath, 'wx');
+    takeLock();
   } catch (err) {
-    const holder = existsSync(lockPath) ? readFileSync(lockPath, 'utf8').trim() : '(unknown)';
-    throw new Error(
-      `nearbytes-sync: dataDir ${dataDir} is already in use by ${holder} (lock at ${lockPath}). ` +
-        `Stop the other process or remove the stale lock file.`,
-    );
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'EEXIST') throw err;
+    const holder = readLockHolder(lockPath);
+    if (holder !== null && isPidAlive(holder.pid)) {
+      throw new Error(
+        `nearbytes-sync: dataDir ${dataDir} is already in use by pid ${holder.raw} (lock at ${lockPath}). ` +
+          `Stop the other process or remove the stale lock file.`,
+      );
+    }
+    // Stale lock from a crashed previous run — replace it.
+    unlinkSync(lockPath);
+    takeLock();
   }
-  writeFileSync(fd, `${process.pid}\n`, 'utf8');
-  closeSync(fd);
+
   let released = false;
-  return () => {
+  const release = (): void => {
     if (released) return;
     released = true;
     try {
-      const onDisk = readFileSync(lockPath, 'utf8').trim();
-      if (onDisk === String(process.pid)) {
+      const onDisk = readLockHolder(lockPath);
+      if (onDisk !== null && onDisk.raw === String(process.pid)) {
         unlinkSync(lockPath);
       }
     } catch {
       // best-effort
     }
   };
+  process.once('exit', release);
+  return release;
 }
 
 export async function start(
