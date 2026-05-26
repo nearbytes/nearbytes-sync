@@ -1,5 +1,5 @@
 import { randomBytes } from 'crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Log } from 'nearbytes-log';
 import { profileSubject, syncTopic } from '../core/topic.js';
@@ -15,6 +15,7 @@ import { exchangeFriendHandshake } from '../core/handshake.js';
 import { FriendSessionRegistry } from '../core/friendSessions.js';
 import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
 import { inflightBlockRegistry, outboundBlockStreamCounter } from '../core/inflightBlocks.js';
+import { acquireSyncLock } from './dataDirLock.js';
 
 export interface StartOptions {
   /** Lower-case hex profile public keys this node serves; see `requirements/sync-protocol-v1.md` SYNC-00. */
@@ -55,7 +56,6 @@ function normalizeKeySet(keys: readonly string[]): Set<string> {
 }
 
 const NODE_ID_FILENAME = '.nearbytes-node-id';
-const DATADIR_LOCK_FILENAME = '.nearbytes-sync.lock';
 const NODE_ID_RE = /^[0-9a-f]{32}$/;
 
 /**
@@ -81,90 +81,6 @@ function loadOrCreateNodeId(dataDir: string | undefined): string {
   const fresh = randomBytes(16).toString('hex');
   writeFileSync(file, fresh, { encoding: 'utf8', flag: 'wx' });
   return fresh;
-}
-
-/**
- * Returns true iff `pid` corresponds to a process this OS user can signal.
- * `process.kill(pid, 0)` performs no signal delivery but still raises
- * EPERM/ESRCH for missing pids, which is exactly the existence check we
- * want for stale-lock detection.
- */
-function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    // EPERM means the process exists but we can't signal it — still alive.
-    return code === 'EPERM';
-  }
-}
-
-function readLockHolder(lockPath: string): { pid: number; raw: string } | null {
-  if (!existsSync(lockPath)) return null;
-  const raw = readFileSync(lockPath, 'utf8').trim();
-  const pid = Number.parseInt(raw, 10);
-  return { pid, raw };
-}
-
-/**
- * Refuses a second `start()` against the same `dataDir`. Two writers on a
- * single append-only log corrupt it, regardless of the sibling-sync layer's
- * behaviour. Lock semantics:
- *
- *   - An exclusive flag file (`O_EXCL`) under `dataDir` stores the holder's
- *     pid; a second `start()` whose holder pid is still alive fails fast
- *     with a message naming it.
- *   - If the holder pid is dead, the lock is considered stale (the previous
- *     process crashed without unlinking), so we silently replace it.
- *   - The returned function releases the lock; we also register a
- *     `process.on('exit')` hook so a clean Node shutdown unlinks the file
- *     even if the caller forgot to `stop()`.
- */
-function acquireDataDirLock(dataDir: string | undefined): () => void {
-  if (dataDir === undefined) return () => {};
-  mkdirSync(dataDir, { recursive: true });
-  const lockPath = join(dataDir, DATADIR_LOCK_FILENAME);
-
-  const takeLock = (): void => {
-    const fd = openSync(lockPath, 'wx');
-    writeFileSync(fd, `${process.pid}\n`, 'utf8');
-    closeSync(fd);
-  };
-
-  try {
-    takeLock();
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== 'EEXIST') throw err;
-    const holder = readLockHolder(lockPath);
-    if (holder !== null && isPidAlive(holder.pid)) {
-      throw new Error(
-        `nearbytes-sync: dataDir ${dataDir} is already in use by pid ${holder.raw} (lock at ${lockPath}). ` +
-          `Stop the other process or remove the stale lock file.`,
-      );
-    }
-    // Stale lock from a crashed previous run — replace it.
-    unlinkSync(lockPath);
-    takeLock();
-  }
-
-  let released = false;
-  const release = (): void => {
-    if (released) return;
-    released = true;
-    try {
-      const onDisk = readLockHolder(lockPath);
-      if (onDisk !== null && onDisk.raw === String(process.pid)) {
-        unlinkSync(lockPath);
-      }
-    } catch {
-      // best-effort
-    }
-  };
-  process.once('exit', release);
-  return release;
 }
 
 export async function start(
@@ -224,7 +140,7 @@ export async function start(
     };
   }
 
-  const releaseDataDirLock = acquireDataDirLock(options.blockStorageRoot);
+  const releaseDataDirLock = acquireSyncLock(options.blockStorageRoot);
   // `peerId` here is the dataDir-derived node identity (DISC-26 loopback
   // key). Stable across process restarts; collides only when two processes
   // genuinely share the same on-disk log — which is also caught by the
