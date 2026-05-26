@@ -33,6 +33,14 @@ export interface SyncSnapshot {
   readonly inflightInbound: number;
   /** Block stream pumps currently queued or running on the outbound wire chain. */
   readonly inflightOutbound: number;
+  /**
+   * Number of currently-alive sibling/friend sessions (post-`hello`).
+   * Bye-time flush logic in CLI consumers MUST refuse to declare "drained"
+   * until this has been > 0 at some point — otherwise fast one-shot writes
+   * (e.g. `nbf file add` against a fresh dataDir) exit before the swarm
+   * has bootstrapped and the local `have` announcement is never made.
+   */
+  readonly connectedPeers: number;
 }
 
 export interface SyncHandle {
@@ -135,7 +143,7 @@ export async function start(
     return {
       friends,
       serveProfilePublicKeys: [...servedSet],
-      snapshot: () => ({ inflightInbound: 0, inflightOutbound: 0 }),
+      snapshot: () => ({ inflightInbound: 0, inflightOutbound: 0, connectedPeers: 0 }),
       async stop() {},
     };
   }
@@ -291,6 +299,7 @@ export async function start(
     snapshot: (): SyncSnapshot => ({
       inflightInbound: inbound.size(),
       inflightOutbound: outbound.size(),
+      connectedPeers: friendSessions.aliveCount,
     }),
     async stop(): Promise<void> {
       /**

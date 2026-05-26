@@ -32,6 +32,20 @@ function transportPreference(label: string): number {
 export class FriendSessionRegistry {
   private readonly sessions = new Map<string, FriendSessionEntry>();
 
+  /**
+   * Count of currently-alive sibling/friend sessions. Used by `SyncSnapshot`
+   * so that CLI bye-time flushes can refuse to declare "drained" until at
+   * least one peer has actually been seen — without this, fast one-shot
+   * writes race past DHT bootstrap and exit before announcing any `have`.
+   */
+  get aliveCount(): number {
+    let n = 0;
+    for (const entry of this.sessions.values()) {
+      if (entry.isAlive()) n++;
+    }
+    return n;
+  }
+
   private sessionKey(remoteProfile: string, remotePeerId: string): string {
     return `${remoteProfile.toLowerCase()}|${remotePeerId.toLowerCase()}`;
   }

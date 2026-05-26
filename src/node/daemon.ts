@@ -124,7 +124,7 @@ function inertHandle(): SyncHandle {
   return {
     friends: [],
     serveProfilePublicKeys: [],
-    snapshot: () => ({ inflightInbound: 0, inflightOutbound: 0 }),
+    snapshot: () => ({ inflightInbound: 0, inflightOutbound: 0, connectedPeers: 0 }),
     stop: async () => {},
   };
 }
