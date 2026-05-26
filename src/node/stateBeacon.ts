@@ -38,6 +38,7 @@
 import { unlink, writeFile, rename, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ConnectedPeer, SyncHandle, SyncSnapshot } from './start.js';
+import type { SyncEvent } from '../core/syncEvents.js';
 
 export const STATE_BEACON_FILENAME = '.nearbytes-sync.state.json';
 export const STATE_BEACON_TMP_SUFFIX = '.nearbytes-sync.state.tmp';
@@ -61,6 +62,17 @@ export interface SyncStateBeaconPayload {
     readonly connectedAt: string;
     readonly role: 'sibling' | 'friend';
   }>;
+  /**
+   * Most-recent wire-level events as exposed by `SyncHandle.recentEvents()`.
+   * Optional for backward compatibility: a beacon written by a daemon
+   * that predates the event bus omits this field, and readers MUST
+   * treat it as an empty list (not as an error).
+   *
+   * Events are oldest-first. Timestamps are epoch ms (the same shape
+   * the in-process `SyncEvent` carries), so a writer-only consumer can
+   * format them with no conversion drift relative to a live consumer.
+   */
+  readonly events?: readonly SyncEvent[];
 }
 
 export interface StateBeaconHandle {
@@ -104,6 +116,7 @@ export function startStateBeacon(opts: {
         connectedAt: p.connectedAt.toISOString(),
         role: p.role,
       })),
+      events: opts.sync.recentEvents(),
     };
   };
 
@@ -213,6 +226,12 @@ export async function readSyncStateBeacon(dataDir: string): Promise<ReadBeaconRe
     typeof payload.snapshot !== 'object' ||
     !Array.isArray(payload.peers)
   ) {
+    return null;
+  }
+  // The `events` field is *optional* (older daemons did not publish one),
+  // so its absence is fine; presence with the wrong shape is a hard reject
+  // because rendering garbage events would be worse than rendering none.
+  if (payload.events !== undefined && !Array.isArray(payload.events)) {
     return null;
   }
   const updatedAtMs = Date.parse(payload.updatedAt);

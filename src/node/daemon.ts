@@ -132,6 +132,8 @@ function inertHandle(): SyncHandle {
     serveProfilePublicKeys: [],
     snapshot: () => ({ inflightInbound: 0, inflightOutbound: 0, connectedPeers: 0 }),
     peers: () => [],
+    onEvent: () => () => {},
+    recentEvents: () => [],
     stop: async () => {},
   };
 }

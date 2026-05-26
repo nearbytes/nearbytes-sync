@@ -6,6 +6,15 @@ export {
   type StartOptions,
 } from './start.js';
 export {
+  type SyncEvent,
+  type SyncEventKind,
+  type PeerConnectedEvent,
+  type PeerDisconnectedEvent,
+  type BlockSentEvent,
+  type BlockReceivedEvent,
+  type EventReceivedEvent,
+} from '../core/syncEvents.js';
+export {
   readSyncStateBeacon,
   type SyncStateBeaconPayload,
   type ReadBeaconResult,

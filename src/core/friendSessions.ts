@@ -1,6 +1,7 @@
 import type { Log } from 'nearbytes-log';
 import { attachPeerSession, type AttachPeerSessionOptions, type DuplexPeer } from './peerLoop.js';
 import { profileSubject } from './topic.js';
+import type { PeerSessionEventEmitter, SyncEventBus } from './syncEvents.js';
 
 export interface FriendSessionEntry {
   readonly remoteProfilePublicKey: string;
@@ -40,6 +41,21 @@ export class FriendSessionRegistry {
   private readonly sessions = new Map<string, FriendSessionEntry>();
 
   /**
+   * Optional observability bus. When set, every `attach()` that creates
+   * a new live session emits `peer-connected`, the close hook emits
+   * `peer-disconnected`, and the per-session adapter forwards
+   * peer-loop block/event activity (see `PeerSessionEventEmitter`).
+   *
+   * The bus is purely additive — a registry constructed without one is
+   * indistinguishable on the wire from a registry constructed with a
+   * silent bus. We accept the injection at construction time so the
+   * `start()` orchestrator can own the bus lifecycle and feed both the
+   * in-memory `SyncHandle.onEvent` listeners and the daemon beacon
+   * publisher from a single source.
+   */
+  constructor(private readonly bus?: SyncEventBus) {}
+
+  /**
    * Count of currently-alive sibling/friend sessions. Used by `SyncSnapshot`
    * so that CLI bye-time flushes can refuse to declare "drained" until at
    * least one peer has actually been seen — without this, fast one-shot
@@ -55,6 +71,53 @@ export class FriendSessionRegistry {
 
   private sessionKey(remoteProfile: string, remotePeerId: string): string {
     return `${remoteProfile.toLowerCase()}|${remotePeerId.toLowerCase()}`;
+  }
+
+  /**
+   * Build a per-session event emitter that bakes the remote identity
+   * into every emission. We construct one of these *per attach* (not
+   * per registry) so the peer-loop's hook sites can stay context-free
+   * even though every emission must carry the remote profile/peerId.
+   */
+  private makeSessionEmitter(
+    remote: string,
+    remotePid: string,
+  ): PeerSessionEventEmitter | undefined {
+    const bus = this.bus;
+    if (bus === undefined) return undefined;
+    return {
+      blockSent: (blockHash, bytes) => {
+        bus.emit({
+          kind: 'block-sent',
+          at: Date.now(),
+          blockHash,
+          bytes,
+          toProfile: remote,
+          toPeerId: remotePid,
+        });
+      },
+      blockReceived: (blockHash, bytes) => {
+        bus.emit({
+          kind: 'block-received',
+          at: Date.now(),
+          blockHash,
+          bytes,
+          fromProfile: remote,
+          fromPeerId: remotePid,
+        });
+      },
+      eventReceived: (channel, eventHash, bytes) => {
+        bus.emit({
+          kind: 'event-received',
+          at: Date.now(),
+          eventHash,
+          channel,
+          bytes,
+          fromProfile: remote,
+          fromPeerId: remotePid,
+        });
+      },
+    };
   }
 
   attach(
@@ -88,12 +151,27 @@ export class FriendSessionRegistry {
     const subject = profileSubject(remote);
     let alive = true;
     let entry: FriendSessionEntry;
+    const sessionEmitter = this.makeSessionEmitter(remote, remotePid);
+    const optionsWithEvents: AttachPeerSessionOptions =
+      sessionEmitter !== undefined
+        ? { ...sessionOptions, events: sessionEmitter }
+        : sessionOptions;
     const stop = attachPeerSession(log, subject, peer, () => {
+      const wasAlive = alive;
       alive = false;
       if (this.sessions.get(key) === entry) {
         this.sessions.delete(key);
       }
-    }, sessionOptions);
+      if (wasAlive && this.bus !== undefined) {
+        this.bus.emit({
+          kind: 'peer-disconnected',
+          at: Date.now(),
+          remoteProfilePublicKey: remote,
+          remotePeerId: remotePid,
+          transportLabel,
+        });
+      }
+    }, optionsWithEvents);
     entry = {
       remoteProfilePublicKey: remote,
       remotePeerId: remotePid,

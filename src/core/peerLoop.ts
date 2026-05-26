@@ -16,6 +16,10 @@ import { appendBenchMarker } from '../benchMarker.js';
 import { logSyncError } from '../logSyncError.js';
 import { registerLocalHaveAnnouncer, type LocalHaveAnnouncer } from './sessionRegistry.js';
 import { inflightBlockRegistry, outboundBlockStreamCounter } from './inflightBlocks.js';
+import {
+  NOOP_PEER_SESSION_EVENT_EMITTER,
+  type PeerSessionEventEmitter,
+} from './syncEvents.js';
 
 /** In-memory RX buffer limit per block stream (512 MiB). */
 const MAX_BLOCK_STREAM_BUFFER_BYTES = 512 * 1024 * 1024;
@@ -72,6 +76,14 @@ export interface AttachPeerSessionOptions {
   readonly blockStorageRoot?: string;
   /** When set with {@link blockStorageRoot}, inbound blocks stream to disk instead of RAM. */
   readonly diskBlockStream?: DiskBlockStreamSinkFactory;
+  /**
+   * Observability sink for wire-level activity on this session. The
+   * caller (typically `FriendSessionRegistry.attach`) bakes the remote
+   * peer's identity into the emitter so the peer-loop can stay
+   * context-free. Defaults to a no-op so tests and in-memory harnesses
+   * can omit it.
+   */
+  readonly events?: PeerSessionEventEmitter;
 }
 
 async function toWireRef(log: Log, ref: ReceptionObjectRef): Promise<ObjectRef> {
@@ -157,6 +169,7 @@ function sendBlockStream(
   ref: Extract<ObjectRef, { kind: 'block' }>,
   bytes: Uint8Array | null,
   totalBytes: number,
+  sessionEvents: PeerSessionEventEmitter,
 ): void {
   const outboundCounter = outboundBlockStreamCounter(log);
   outboundCounter.begin();
@@ -193,6 +206,7 @@ function sendBlockStream(
           pumpBeginAt: pumped.pumpBeginAt,
           pumpEndAt: pumped.pumpEndAt,
         }).catch((err) => logSyncError('bulk-send-phases', err));
+        sessionEvents.blockSent(ref.hash, pumped.bytes);
       }
     } catch (err) {
       logSyncError(`sendBlockStream:${ref.hash.slice(0, 16)}`, err);
@@ -232,6 +246,8 @@ export function attachPeerSession(
 ): () => void {
   const storageRoot = options.blockStorageRoot;
   const diskBlockStream = options.diskBlockStream;
+  const sessionEvents: PeerSessionEventEmitter =
+    options.events ?? NOOP_PEER_SESSION_EVENT_EMITTER;
   let inboundWire = Promise.resolve();
   let outboundWire = Promise.resolve();
   const runInbound = (fn: () => void | Promise<void>): void => {
@@ -376,12 +392,12 @@ export function attachPeerSession(
           continue;
         }
         if (storageRoot) {
-          sendBlockStream(log, runOutbound, peer, storageRoot, ref, null, 0);
+          sendBlockStream(log, runOutbound, peer, storageRoot, ref, null, 0, sessionEvents);
           continue;
         }
         const bytes = await readLocalBytes(log, ref);
         if (bytes) {
-          sendBlockStream(log, runOutbound, peer, storageRoot, ref, bytes, bytes.byteLength);
+          sendBlockStream(log, runOutbound, peer, storageRoot, ref, bytes, bytes.byteLength, sessionEvents);
         }
       }
       for (const ref of events) {
@@ -410,6 +426,11 @@ export function attachPeerSession(
           channel: msg.object.channel.slice(0, 16),
           bytes: msg.bytes.byteLength,
         });
+        sessionEvents.eventReceived(
+          msg.object.channel,
+          msg.object.hash,
+          msg.bytes.byteLength,
+        );
       }
     }
   };
@@ -426,6 +447,7 @@ export function attachPeerSession(
         hash: hash.slice(0, 16),
         bytes: bytes.byteLength,
       });
+      sessionEvents.blockReceived(hash, bytes.byteLength);
     }
   };
 
@@ -478,6 +500,7 @@ export function attachPeerSession(
       hash: hash.slice(0, 16),
       bytes,
     });
+    sessionEvents.blockReceived(hash, bytes);
   };
 
   const finishIncomingStream = async (): Promise<void> => {

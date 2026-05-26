@@ -16,6 +16,11 @@ import { FriendSessionRegistry } from '../core/friendSessions.js';
 import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
 import { inflightBlockRegistry, outboundBlockStreamCounter } from '../core/inflightBlocks.js';
 import { acquireSyncLock } from './dataDirLock.js';
+import {
+  SyncEventBuffer,
+  SyncEventBus,
+  type SyncEvent,
+} from '../core/syncEvents.js';
 
 export interface StartOptions {
   /** Lower-case hex profile public keys this node serves; see `requirements/sync-protocol-v1.md` SYNC-00. */
@@ -96,6 +101,27 @@ export interface SyncHandle {
    * sibling on the LAN, or over the DHT?".
    */
   peers(): readonly ConnectedPeer[];
+  /**
+   * Subscribe to live wire-level events (`peer-connected`,
+   * `peer-disconnected`, `block-sent`, `block-received`,
+   * `event-received`). Returns an unsubscribe thunk.
+   *
+   * Used by `nbf monitor` and similar observability tooling when this
+   * process is the active sync engine. In writer-only mode the handle
+   * is a stub and `onEvent` returns immediately — the daemon's beacon
+   * is the source of truth there (see `readSyncStateBeacon`).
+   *
+   * The handler MUST be non-blocking: emissions happen on the wire's
+   * critical path (hot loop). A slow handler degrades throughput.
+   */
+  onEvent(handler: (event: SyncEvent) => void): () => void;
+  /**
+   * Snapshot of the most recent events still resident in the in-memory
+   * ring buffer (oldest-first, capped at the buffer's capacity). Lets
+   * an observability UI render a backlog on first paint without
+   * waiting for new traffic.
+   */
+  recentEvents(): readonly SyncEvent[];
   stop(): Promise<void>;
 }
 
@@ -189,6 +215,8 @@ export async function start(
       serveProfilePublicKeys: [...servedSet],
       snapshot: () => ({ inflightInbound: 0, inflightOutbound: 0, connectedPeers: 0 }),
       peers: () => [],
+      onEvent: () => () => {},
+      recentEvents: () => [],
       async stop() {},
     };
   }
@@ -227,7 +255,15 @@ export async function start(
   }
   const discovery = createCompositeDiscovery(backends);
 
-  const friendSessions = new FriendSessionRegistry();
+  // Observability bus owned by start(): every wire-level event flows
+  // through here, and `start()` is the single point that wires both
+  // the in-process ring buffer (for `SyncHandle.recentEvents()`) and
+  // any out-of-process publisher (the daemon's beacon) onto it.
+  const eventBus = new SyncEventBus();
+  const eventBuffer = new SyncEventBuffer();
+  eventBus.onEvent((e) => eventBuffer.push(e));
+
+  const friendSessions = new FriendSessionRegistry(eventBus);
   const connectingPairs = new Set<string>();
 
   const openFriendAssociation = (
@@ -297,6 +333,25 @@ export async function start(
             localProfile: localProfileForAssoc.slice(0, 16),
             sibling: remoteProfile === localProfileForAssoc,
           });
+          // The friend-session-attached marker above is journal-grade
+          // and survives restarts; the bus emit below is live-grade
+          // and feeds the in-process monitor (`SyncHandle.onEvent`)
+          // and the daemon beacon. Both fire here because they answer
+          // the same question — "we now have a live peer" — at
+          // different latencies and durabilities. peer-disconnected
+          // is emitted by `FriendSessionRegistry` itself when the
+          // close hook fires; no symmetric call here.
+          eventBus.emit({
+            kind: 'peer-connected',
+            at: Date.now(),
+            remoteProfilePublicKey: remoteProfile,
+            remotePeerId,
+            transportLabel: discovered.label,
+            role:
+              remoteProfile === localProfileForAssoc
+                ? ('sibling' as const)
+                : ('friend' as const),
+          });
         }
 
         connectingPairs.delete(pairKey);
@@ -360,6 +415,8 @@ export async function start(
             ? ('sibling' as const)
             : ('friend' as const),
       })),
+    onEvent: (handler) => eventBus.onEvent(handler),
+    recentEvents: () => eventBuffer.recent(),
     async stop(): Promise<void> {
       /**
        * Teardown contract: every step is best-effort and the dataDir lock
