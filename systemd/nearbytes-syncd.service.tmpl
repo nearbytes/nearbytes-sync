@@ -1,0 +1,35 @@
+[Unit]
+Description=Nearbytes sync daemon (nbsync)
+Documentation=https://github.com/nearbytes/nearbytes-sync
+# Networking primitives must be up before we try to bind sockets.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Templated by scripts/install-systemd.mjs at install time. Both paths
+# are absolute so the unit works regardless of the user's $PATH or
+# working directory when the service is started.
+ExecStart=__NODE_BIN__ __NBSYNC_JS__ daemon --config __CONFIG_PATH__
+# SIGTERM tells nbsync to flush, release the dataDir lock, and exit 0.
+# We give it enough time to finish in-flight block streams.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# Re-read config without a full restart. nbsync's SIGHUP handler reloads
+# the config file as if `fs.watch` fired (same code path).
+ExecReload=/bin/kill -HUP $MAINPID
+# Restart on crash but throttle so a tight crash loop doesn't burn the
+# CPU. Five seconds is enough for sockets/locks to fully release.
+Restart=on-failure
+RestartSec=5
+# stdout/stderr go to the systemd journal. View with:
+#   journalctl --user -u nearbytes-syncd -f
+StandardOutput=journal
+StandardError=journal
+# Reasonable resource ceilings for a personal-device sync daemon.
+# These are advisory: nbsync is normally well under these limits.
+MemoryMax=512M
+TasksMax=128
+
+[Install]
+WantedBy=default.target

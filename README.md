@@ -24,3 +24,46 @@ npm run build
 Integration tests live in `nearbytes-files` (`yarn e2e:local`, `yarn e2e:bidirectional:local`). This package is consumed via `nearbytes-skeleton` `start(log, friends, { serveProfilePublicKey })`.
 
 Built output is `dist/` (gitignored); do not commit `dist/`.
+
+## Daemon (`nbsync`)
+
+Long-running sync daemon that owns the [DISC-27](https://github.com/nearbytes/nearbytes-specs/blob/main/requirements/sync-discovery-v1.md) sync-singleton lock and keeps friend carriage running 24/7. Cross-process writers (the file CLI, scripts) coexist by appending to the same dataDir; the daemon's `chokidar` watcher notices the new event/block files and pushes `have` to peers.
+
+```sh
+yarn build
+node bin/nbsync.mjs daemon        # foreground, reads ~/.nearbytes/config.json
+node bin/nbsync.mjs status        # report dataDir + lock state
+node bin/nbsync.mjs probe <dir>   # just probe the lock
+```
+
+The daemon watches:
+
+| What | Fires on | Action |
+|---|---|---|
+| `~/.nearbytes/config.json` | save (debounced 250 ms) | `reloadSync(friends, profiles)` if changed |
+| `<dataDir>/channels/<pk>/*.bin` | new file | append reception → `have` to peers |
+| `<dataDir>/blocks/*.bin` | new file | append reception → `have` to peers |
+| `SIGTERM` / `SIGINT` | once | flush, release lock, exit 0 |
+| `SIGHUP` | once | manual config re-read (same code path as fs.watch) |
+
+### Install as a systemd user service (Ubuntu 18.04+)
+
+```sh
+yarn build
+yarn install:systemd                          # writes ~/.config/systemd/user/nearbytes-syncd.service
+systemctl --user enable --now nearbytes-syncd # autostart on login, start now
+systemctl --user status        nearbytes-syncd
+journalctl  --user  -u         nearbytes-syncd -f
+```
+
+To pick up config changes without a full restart, either save `~/.nearbytes/config.json` (the daemon's `fs.watch` fires within 250 ms) or `systemctl --user reload nearbytes-syncd` (sends `SIGHUP`).
+
+To uninstall: `yarn uninstall:systemd`.
+
+### macOS launchd
+
+systemd is Linux-only. On macOS, drop the following plist at `~/Library/LaunchAgents/com.nearbytes.syncd.plist` and `launchctl load -w` it (template ships in `systemd/launchd.plist.tmpl` if you want a starting point; for now the file is small enough to write by hand).
+
+### Coexistence with the CLI
+
+Per DISC-27 (split form: singleton sync, plural writers), the lock only protects the *sync engine*. Multiple processes MAY write events into the same dataDir simultaneously — content-addressed naming makes that CRDT-trivial, and `nearbytes-log`'s `fsIo.writeFile` publishes via `link(2)` first-wins. The skeleton's `bootSync` checks `probeSyncLock()` and falls back to a writer-only handle when a daemon is active, so the file CLI works alongside the daemon without conflict.
