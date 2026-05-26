@@ -6,6 +6,12 @@ export {
   type StartOptions,
 } from './start.js';
 export {
+  readSyncStateBeacon,
+  type SyncStateBeaconPayload,
+  type ReadBeaconResult,
+  STATE_BEACON_FILENAME,
+} from './stateBeacon.js';
+export {
   probeSyncLock,
   SyncAlreadyRunningError,
   DATADIR_LOCK_FILENAME,

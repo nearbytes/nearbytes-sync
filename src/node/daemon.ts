@@ -46,6 +46,12 @@ import {
   type SyncDaemonConfig,
 } from './daemonConfig.js';
 import { probeSyncLock } from './dataDirLock.js';
+import {
+  STATE_BEACON_FILENAME,
+  STATE_BEACON_TMP_SUFFIX,
+  startStateBeacon,
+  type StateBeaconHandle,
+} from './stateBeacon.js';
 
 export interface DaemonOptions {
   /** Absolute path to the JSON config file. */
@@ -211,10 +217,22 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
   let sync = await startSyncFromConfig(log, config);
   reportUp(config, sync);
 
+  /**
+   * Publish snapshot+peers state for out-of-process observers (e.g.
+   * `nbf monitor` in writer-only mode). Lifetime matches the daemon
+   * itself; restarted across config reloads to follow the new
+   * SyncHandle, then torn down on shutdown.
+   */
+  let beacon: StateBeaconHandle = startStateBeacon({ dataDir: config.dataDir, sync });
+
   const dataWatcher = chokidar.watch(
     [join(config.dataDir, 'channels'), join(config.dataDir, 'blocks')],
     {
-      ignored: (path) => path.endsWith('.tmp') || /\.[0-9a-f]{16}\.tmp$/i.test(path),
+      ignored: (path) =>
+        path.endsWith('.tmp') ||
+        /\.[0-9a-f]{16}\.tmp$/i.test(path) ||
+        path.endsWith(STATE_BEACON_FILENAME) ||
+        path.endsWith(STATE_BEACON_TMP_SUFFIX),
       ignoreInitial: true,
       persistent: true,
       awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
@@ -242,9 +260,11 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
     console.error(
       `[nbsync] reload · profiles ${config.profiles.length}→${next.profiles.length} · friends ${config.friends.length}→${next.friends.length}`,
     );
+    await beacon.stop();
     await sync.stop();
     config = { ...next, dataDir: config.dataDir };
     sync = await startSyncFromConfig(log, config);
+    beacon = startStateBeacon({ dataDir: config.dataDir, sync });
     reportUp(config, sync);
     options.onReload?.(config);
   };
@@ -262,6 +282,7 @@ export async function runDaemon(options: DaemonOptions): Promise<void> {
     configWatcher.close();
     await dataWatcher.close();
     await reloadInFlight.catch(() => {});
+    await beacon.stop();
     await sync.stop();
     process.exit(0);
   };
