@@ -4,7 +4,7 @@ import type { DuplexPeer } from '../../core/peerLoop.js';
 import type { DiscoveredPeer, PeerDiscovery } from '../../discovery/types.js';
 import { logPeerSocketError } from '../../logSyncError.js';
 import { duplexFromTcpSocket } from '../netDuplex.js';
-import { dhtTransportLabel } from './transportLabel.js';
+import { dhtTransportLabel, waitForDhtTransportLabel } from './transportLabel.js';
 
 /**
  * NOTE: socket `'error'` is intentionally NOT handled here — the
@@ -93,17 +93,26 @@ export function createHyperswarmDiscovery(options: {
       if (!peerHandler) {
         return;
       }
-      const label = dhtTransportLabel(socket);
       socket.on('error', (err: unknown) => {
-        logPeerSocketError(`dht ${label.slice(4)}`, err);
+        const tag = dhtTransportLabel(socket).replace(/^dht:/, '');
+        logPeerSocketError(`dht ${tag}`, err);
       });
       const duplex = duplexFromSocket(socket);
-      peerHandler({
-        transport: 'duplex',
-        label,
-        connect: async () => duplex,
-        associationProfile: pickAssociationProfile(peerInfo.topics),
-      });
+      void (async () => {
+        let label = dhtTransportLabel(socket);
+        if (label === 'dht:unknown') {
+          label = await waitForDhtTransportLabel(socket);
+        }
+        if (!peerHandler) {
+          return;
+        }
+        peerHandler({
+          transport: 'duplex',
+          label,
+          connect: async () => duplex,
+          associationProfile: pickAssociationProfile(peerInfo.topics),
+        });
+      })();
     },
   );
 
