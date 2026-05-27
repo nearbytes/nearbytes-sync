@@ -4,6 +4,7 @@ import type { DuplexPeer } from '../../core/peerLoop.js';
 import type { DiscoveredPeer, PeerDiscovery } from '../../discovery/types.js';
 import { logPeerSocketError } from '../../logSyncError.js';
 import { duplexFromTcpSocket } from '../netDuplex.js';
+import { dhtTransportLabel } from './transportLabel.js';
 
 /**
  * NOTE: socket `'error'` is intentionally NOT handled here — the
@@ -92,13 +93,14 @@ export function createHyperswarmDiscovery(options: {
       if (!peerHandler) {
         return;
       }
+      const label = dhtTransportLabel(socket);
       socket.on('error', (err: unknown) => {
-        logPeerSocketError(`hyperswarm peer:${peerInfo.publicKey.toString('hex').slice(0, 12)}`, err);
+        logPeerSocketError(`dht ${label.slice(4)}`, err);
       });
       const duplex = duplexFromSocket(socket);
       peerHandler({
         transport: 'duplex',
-        label: `hyperswarm:${peerInfo.publicKey.toString('hex').slice(0, 12)}`,
+        label,
         connect: async () => duplex,
         associationProfile: pickAssociationProfile(peerInfo.topics),
       });

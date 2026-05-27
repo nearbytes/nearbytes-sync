@@ -69,7 +69,8 @@ export interface ConnectedPeer {
    * Transport route taken by this association. Examples:
    *   `mdns-tcp:192.168.1.5:53432` — mDNS-discovered TCP on the LAN
    *   `mdns:<peerId-prefix>`       — pre-TCP-handshake mDNS sighting
-   *   `hyperswarm:<short-pubkey>`  — DHT-routed, transport is UTP/TCP
+   *   `dht:<host>:<port>`          — DHT-routed (Hyperswarm UDX/TCP); legacy
+   *   `hyperswarm:<short-pubkey>`  labels are still accepted by the CLI
    * The label is exactly what discovery emitted; it is the user-facing
    * answer to "where did this peer come from?".
    */
