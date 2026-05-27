@@ -89,6 +89,24 @@ export interface SyncHandle {
   readonly friends: readonly string[];
   readonly serveProfilePublicKeys: readonly string[];
   /**
+   * Stable per-`dataDir` node identity (DISC-26 loopback key, 16 random
+   * bytes hex-encoded). Survives process restarts; identifies *this*
+   * physical node regardless of which profile it serves at any moment.
+   *
+   * Used by observability tooling to answer "who am I, on the wire?"
+   * and to map peer-table rows to known machines. In inert mode (no
+   * dataDir, no profile) or writer-only mode (a daemon owns the lock)
+   * the value is the empty string — the daemon's beacon is the source
+   * of truth for the *actual* engine's identity in that case.
+   */
+  readonly peerId: string;
+  /**
+   * Hex-encoded public key of the profile the engine is currently
+   * authoring under. Always one of `serveProfilePublicKeys` when the
+   * engine is live; empty string in inert / writer-only modes.
+   */
+  readonly activeProfilePublicKey: string;
+  /**
    * Point-in-time view of sync activity, used by CLIs to implement a clean
    * `bye`/`quit` flush ("wait until quiet before exiting"). Cheap to call:
    * just reads two counters on the per-Log inflight registries.
@@ -172,6 +190,26 @@ function loadOrCreateNodeId(dataDir: string | undefined): string {
   return fresh;
 }
 
+/**
+ * Read the persisted per-`dataDir` node identity *without* creating one
+ * if missing. Returns the empty string if the file does not exist, is
+ * unreadable, or contains a value that does not match the canonical
+ * 32-hex shape. Used by writer-only consumers (the skeleton's
+ * writer-only sync stub) that need to know "what id is the daemon
+ * using for this dataDir?" but must not race the daemon for file
+ * creation.
+ */
+export function peekNodeId(dataDir: string): string {
+  try {
+    const file = join(dataDir, NODE_ID_FILENAME);
+    if (!existsSync(file)) return '';
+    const existing = readFileSync(file, 'utf8').trim().toLowerCase();
+    return NODE_ID_RE.test(existing) ? existing : '';
+  } catch {
+    return '';
+  }
+}
+
 export async function start(
   log: Log,
   friends: readonly string[],
@@ -224,6 +262,8 @@ export async function start(
     return {
       friends,
       serveProfilePublicKeys: [...servedSet],
+      peerId: '',
+      activeProfilePublicKey: activeProfile,
       snapshot: () => ({ inflightInbound: 0, inflightOutbound: 0, connectedPeers: 0 }),
       peers: () => [],
       onEvent: () => () => {},
@@ -440,6 +480,8 @@ export async function start(
   return {
     friends,
     serveProfilePublicKeys: [...servedSet],
+    peerId,
+    activeProfilePublicKey: activeProfile,
     snapshot: (): SyncSnapshot => ({
       inflightInbound: inbound.size(),
       inflightOutbound: outbound.size(),

@@ -1,5 +1,6 @@
 export {
   start,
+  peekNodeId,
   type SyncHandle,
   type SyncSnapshot,
   type ConnectedPeer,
