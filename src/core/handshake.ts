@@ -5,6 +5,31 @@ import type { Subject, SyncMessage } from './types.js';
 
 const PROTOCOL = 'nearbytes.sync.v1' as const;
 
+/** Machine-readable reason for a failed pre-sync hello exchange. */
+export type SyncHandshakeFailureCode =
+  | 'timeout'
+  | 'unsupported-protocol'
+  | 'duplicate-nonce'
+  | 'unauthorized-profile'
+  | 'process-loopback';
+
+/**
+ * Expected handshake failure (timeout, race, policy). Callers MUST NOT
+ * log these with a stack trace — discovery will retry or the operator
+ * sees a single-line `peer-connect-failed` event in the monitor.
+ */
+export class SyncHandshakeError extends Error {
+  readonly name = 'SyncHandshakeError';
+
+  constructor(
+    readonly code: SyncHandshakeFailureCode,
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+  }
+}
+
 export interface FriendHandshakeOptions {
   readonly localProfilePublicKey: string;
   readonly localPeerId: string;
@@ -45,7 +70,7 @@ export function exchangeFriendHandshake(
     const timeout = setTimeout(() => {
       stopHandshakeData?.();
       peer.close();
-      reject(new Error('sync handshake timed out'));
+      reject(new SyncHandshakeError('timeout', 'sync handshake timed out', true));
     }, options.timeoutMs ?? 15_000);
 
     const clearTimer = (): void => clearTimeout(timeout);
@@ -85,14 +110,26 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
-        reject(new Error(`sync handshake: unsupported protocol ${msg.protocol}`));
+        reject(
+          new SyncHandshakeError(
+            'unsupported-protocol',
+            `sync handshake: unsupported protocol ${msg.protocol}`,
+            false,
+          ),
+        );
         return;
       }
       if (seenNonces.has(msg.sessionNonce)) {
         detachHandshake();
         clearTimer();
         peer.close();
-        reject(new Error('sync handshake: duplicate sessionNonce'));
+        reject(
+          new SyncHandshakeError(
+            'duplicate-nonce',
+            'sync handshake: duplicate sessionNonce',
+            true,
+          ),
+        );
         return;
       }
       seenNonces.add(msg.sessionNonce);
@@ -102,7 +139,13 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
-        reject(new Error('sync handshake: remote is not an authorized profile'));
+        reject(
+          new SyncHandshakeError(
+            'unauthorized-profile',
+            'sync handshake: remote is not an authorized profile',
+            false,
+          ),
+        );
         return;
       }
       const remotePeerId = msg.senderPeerId?.toLowerCase() ?? '';
@@ -110,7 +153,13 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
-        reject(new Error('sync handshake: process-level loopback'));
+        reject(
+          new SyncHandshakeError(
+            'process-loopback',
+            'sync handshake: process-level loopback',
+            false,
+          ),
+        );
         return;
       }
       remoteResult = { remoteProfile: remote, remotePeerId };

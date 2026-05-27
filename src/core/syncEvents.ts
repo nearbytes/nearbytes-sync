@@ -24,7 +24,7 @@
  *    in-process and serialised shapes are identical — no marshalling
  *    boundary, no Date↔string conversion drift between LIVE and
  *    DAEMON modes in the monitor UI.
- *  - The discriminated union is closed and small (five kinds today).
+ *  - The discriminated union is closed and small (six kinds today).
  *    Adding a kind is a breaking change for exhaustive switches in
  *    consumers, which is intentional: a new kind without a UI label
  *    would be silently invisible to operators.
@@ -54,6 +54,28 @@ export interface PeerDisconnectedEvent {
   readonly remoteProfilePublicKey: string;
   readonly remotePeerId: string;
   readonly transportLabel: string;
+}
+
+/**
+ * Association attempt failed before a session was registered (handshake
+ * timeout, transport reset, policy reject). Emitted once per failed
+ * attempt sequence (after retries are exhausted). The monitor renders
+ * this instead of surfacing a stderr stack trace.
+ */
+export interface PeerConnectFailedEvent {
+  readonly kind: 'peer-connect-failed';
+  readonly at: number;
+  readonly transportLabel: string;
+  /** Short machine tag, e.g. `handshake-timeout`. */
+  readonly reason: string;
+  /** Handshake attempts made (1 = no retry). */
+  readonly attempts: number;
+  /**
+   * Remote profile hex when known (post-hello or mDNS hint); empty when
+   * the failure happened before identity was established.
+   */
+  readonly remoteProfilePublicKey: string;
+  readonly remotePeerId: string;
 }
 
 /** A block stream finished pumping to a specific peer (outbound). */
@@ -92,6 +114,7 @@ export interface EventReceivedEvent {
 export type SyncEvent =
   | PeerConnectedEvent
   | PeerDisconnectedEvent
+  | PeerConnectFailedEvent
   | BlockSentEvent
   | BlockReceivedEvent
   | EventReceivedEvent;

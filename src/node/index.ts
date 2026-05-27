@@ -11,6 +11,7 @@ export {
   type SyncEventKind,
   type PeerConnectedEvent,
   type PeerDisconnectedEvent,
+  type PeerConnectFailedEvent,
   type BlockSentEvent,
   type BlockReceivedEvent,
   type EventReceivedEvent,

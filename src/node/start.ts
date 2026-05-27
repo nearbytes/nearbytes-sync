@@ -10,7 +10,13 @@ import { createHyperswarmDiscovery } from './discovery/hyperswarm.js';
 import { createMdnsDiscovery } from './discovery/mdns.js';
 import { appendBenchMarker } from '../benchMarker.js';
 import { patchLogForReactiveHave } from '../core/sessionRegistry.js';
-import { logSyncError, logPeerSocketError } from '../logSyncError.js';
+import {
+  logSyncError,
+  logPeerSocketError,
+  logFriendConnectError,
+  logFriendConnectRetry,
+  classifyFriendConnectError,
+} from '../logSyncError.js';
 import { exchangeFriendHandshake } from '../core/handshake.js';
 import { FriendSessionRegistry } from '../core/friendSessions.js';
 import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
@@ -341,6 +347,7 @@ export async function start(
         break;
       case 'peer-connected':
       case 'peer-disconnected':
+      case 'peer-connect-failed':
         // Peer transitions do not move bytes; nothing to accumulate.
         break;
     }
@@ -348,6 +355,9 @@ export async function start(
 
   const friendSessions = new FriendSessionRegistry(eventBus);
   const connectingPairs = new Set<string>();
+
+  const FRIEND_CONNECT_MAX_ATTEMPTS = 3;
+  const FRIEND_CONNECT_RETRY_MS = 2_000;
 
   const openFriendAssociation = (
     discovered: DiscoveredPeer,
@@ -359,7 +369,9 @@ export async function start(
       : activeProfile;
     let remoteProfileHint = expectedRemote?.toLowerCase();
     let pairKeyOptimistic: string | null = null;
+    const connectScope = `friend-connect:${discovered.label}`;
     void (async () => {
+      for (let attempt = 1; attempt <= FRIEND_CONNECT_MAX_ATTEMPTS; attempt++) {
       try {
         const duplex = await connectDiscoveredPeer(discovered);
         if (
@@ -439,11 +451,42 @@ export async function start(
 
         connectingPairs.delete(pairKey);
         pairKeyOptimistic = null;
+        return;
       } catch (err) {
-        logPeerSocketError(`friend-connect:${discovered.label}`, err);
+        const classified = classifyFriendConnectError(err);
+        const canRetry =
+          classified.retryable && attempt < FRIEND_CONNECT_MAX_ATTEMPTS;
+        if (canRetry) {
+          logFriendConnectRetry(
+            connectScope,
+            classified.tag,
+            attempt + 1,
+            FRIEND_CONNECT_MAX_ATTEMPTS,
+            FRIEND_CONNECT_RETRY_MS,
+          );
+          await new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, FRIEND_CONNECT_RETRY_MS);
+            if (typeof t.unref === 'function') {
+              t.unref();
+            }
+          });
+          continue;
+        }
+        logFriendConnectError(connectScope, err);
+        eventBus.emit({
+          kind: 'peer-connect-failed',
+          at: Date.now(),
+          transportLabel: discovered.label,
+          reason: classified.tag,
+          attempts: attempt,
+          remoteProfilePublicKey: remoteProfileHint ?? '',
+          remotePeerId: '',
+        });
         if (pairKeyOptimistic !== null) {
           connectingPairs.delete(pairKeyOptimistic);
         }
+        return;
+      }
       }
     })();
   };
