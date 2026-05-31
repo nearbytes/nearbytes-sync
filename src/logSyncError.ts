@@ -154,7 +154,7 @@ const HANDSHAKE_REASON_TAG: Record<SyncHandshakeFailureCode, string> = {
   'unsupported-protocol': 'handshake-protocol',
   'duplicate-nonce': 'handshake-race',
   'unauthorized-profile': 'handshake-rejected',
-  'process-loopback': 'handshake-loopback',
+  'instance-loopback': 'handshake-loopback',
 };
 
 export function classifyFriendConnectError(err: unknown): ClassifiedFriendConnectError {
@@ -163,7 +163,7 @@ export function classifyFriendConnectError(err: unknown): ClassifiedFriendConnec
       reason: err.code,
       expected: true,
       retryable: err.retryable,
-      silent: err.code === 'process-loopback',
+      silent: err.code === 'instance-loopback',
       tag: HANDSHAKE_REASON_TAG[err.code],
     };
   }

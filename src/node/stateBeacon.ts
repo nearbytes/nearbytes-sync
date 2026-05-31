@@ -52,10 +52,9 @@ export interface SyncStateBeaconPayload {
   readonly dataDir: string;
   /** ISO-8601 UTC. */
   readonly updatedAt: string;
-  /**
-   * Per-`dataDir` node identity (DISC-26). Optional for backward
-   * compatibility with beacons written before this field existed.
-   */
+  /** Per-`dataDir` cryptographic instance identity (DISC-27). */
+  readonly instancePublicKey?: string;
+  /** Short stable per-`dataDir` diagnostic/transport peer id (DISC-27). */
   readonly peerId?: string;
   /**
    * Active served profile public key (hex). Optional for the same
@@ -65,6 +64,7 @@ export interface SyncStateBeaconPayload {
   readonly snapshot: SyncSnapshot;
   readonly peers: ReadonlyArray<{
     readonly remoteProfilePublicKey: string;
+    readonly remoteInstancePublicKey: string;
     readonly remotePeerId: string;
     readonly transportLabel: string;
     readonly localAssociationProfile: string;
@@ -124,11 +124,13 @@ export function startStateBeacon(opts: {
       pid: process.pid,
       dataDir: opts.dataDir,
       updatedAt: new Date().toISOString(),
+      instancePublicKey: opts.sync.instancePublicKey,
       peerId: opts.sync.peerId,
       activeProfilePublicKey: opts.sync.activeProfilePublicKey,
       snapshot: opts.sync.snapshot(),
       peers: peers.map((p) => ({
         remoteProfilePublicKey: p.remoteProfilePublicKey,
+        remoteInstancePublicKey: p.remoteInstancePublicKey,
         remotePeerId: p.remotePeerId,
         transportLabel: p.transportLabel,
         localAssociationProfile: p.localAssociationProfile,

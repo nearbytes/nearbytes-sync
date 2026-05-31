@@ -20,13 +20,10 @@ export type SyncMessage =
       readonly subject: Subject;
       readonly sessionNonce: string;
       readonly senderProfile?: string;
-      /**
-       * Random per-process identifier (lower-case hex) introduced in
-       * `sync-discovery-v1.md` DISC-26. Distinguishes sibling devices that
-       * share the same `senderProfile` so the friend-session registry can
-       * key sessions by `(profile, peerId)` instead of profile alone.
-       */
+      /** Short stable per-dataDir peer id (lower-case hex; DISC-27). */
       readonly senderPeerId?: string;
+      /** Per-dataDir instance public key (lower-case hex; DISC-27). */
+      readonly senderInstancePublicKey?: string;
     }
   | {
       readonly type: 'delta';

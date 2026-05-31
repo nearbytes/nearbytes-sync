@@ -1,6 +1,3 @@
-import { randomBytes } from 'crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { join } from 'path';
 import type { Log } from 'nearbytes-log';
 import { profileSubject, syncTopic } from '../core/topic.js';
 import { createCompositeDiscovery } from '../discovery/composite.js';
@@ -22,6 +19,9 @@ import { FriendSessionRegistry } from '../core/friendSessions.js';
 import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
 import { inflightBlockRegistry, outboundBlockStreamCounter } from '../core/inflightBlocks.js';
 import { acquireSyncLock } from './dataDirLock.js';
+import { createFetchCursorStore } from './fetchCursors.js';
+import { loadOrCreateInstanceIdentity, peekInstancePublicKey } from './instanceIdentity.js';
+import { loadOrCreateNodeId, peekNodeId as peekStoredNodeId } from './nodeId.js';
 import {
   SyncEventBuffer,
   SyncEventBus,
@@ -60,15 +60,16 @@ export interface ConnectedPeer {
   /** Profile public key the remote signs under for this association. */
   readonly remoteProfilePublicKey: string;
   /**
-   * Stable per-process node identity of the remote (DISC-26). Two sibling
-   * devices that share the same `remoteProfilePublicKey` have different
-   * `remotePeerId`s and each appear as a distinct entry here.
+   * Stable per-dataDir instance identity of the remote (DISC-26/27). Two
+   * sibling devices that share the same `remoteProfilePublicKey` have different
+   * `remoteInstancePublicKey`s and each appear as a distinct entry here.
    */
+  readonly remoteInstancePublicKey: string;
   readonly remotePeerId: string;
   /**
    * Transport route taken by this association. Examples:
    *   `mdns-tcp:192.168.1.5:53432` — mDNS-discovered TCP on the LAN
-   *   `mdns:<peerId-prefix>`       — pre-TCP-handshake mDNS sighting
+   *   `mdns:<instance-prefix>`     — pre-TCP-handshake mDNS sighting
    *   `dht:<host>:<port>`          — DHT-routed (Hyperswarm UDX/TCP); legacy
    *   `hyperswarm:<short-pubkey>`  labels are still accepted by the CLI
    * The label is exactly what discovery emitted; it is the user-facing
@@ -96,9 +97,9 @@ export interface SyncHandle {
   readonly friends: readonly string[];
   readonly serveProfilePublicKeys: readonly string[];
   /**
-   * Stable per-`dataDir` node identity (DISC-26 loopback key, 16 random
-   * bytes hex-encoded). Survives process restarts; identifies *this*
-   * physical node regardless of which profile it serves at any moment.
+   * Stable per-`dataDir` instance identity (DISC-27 loopback key, P-256
+   * public key hex). Survives process restarts; identifies this storage
+   * instance regardless of which profile it serves at any moment.
    *
    * Used by observability tooling to answer "who am I, on the wire?"
    * and to map peer-table rows to known machines. In inert mode (no
@@ -106,6 +107,8 @@ export interface SyncHandle {
    * the value is the empty string — the daemon's beacon is the source
    * of truth for the *actual* engine's identity in that case.
    */
+  readonly instancePublicKey: string;
+  /** Short stable per-`dataDir` diagnostic/transport peer id (DISC-27). */
   readonly peerId: string;
   /**
    * Hex-encoded public key of the profile the engine is currently
@@ -169,53 +172,19 @@ function normalizeKeySet(keys: readonly string[]): Set<string> {
   return set;
 }
 
-const NODE_ID_FILENAME = '.nearbytes-node-id';
-const NODE_ID_RE = /^[0-9a-f]{32}$/;
-
 /**
- * Returns the per-`dataDir` node identity used to filter sibling loopback
- * (`sync-discovery-v1.md` DISC-26). Two processes that share the same
- * `dataDir` are the *same* node and MUST NOT see each other as siblings;
- * persisting the id under the directory makes "same storage = same node"
- * the unambiguous loopback predicate, independent of OS process identity.
- *
- * For purely in-memory deployments (`dataDir` undefined) we fall back to a
- * per-process random id so the discovery layer still has something to key
- * loopback by, accepting that two such processes can never collide on
- * storage anyway.
- */
-function loadOrCreateNodeId(dataDir: string | undefined): string {
-  if (dataDir === undefined) return randomBytes(16).toString('hex');
-  mkdirSync(dataDir, { recursive: true });
-  const file = join(dataDir, NODE_ID_FILENAME);
-  if (existsSync(file)) {
-    const existing = readFileSync(file, 'utf8').trim().toLowerCase();
-    if (NODE_ID_RE.test(existing)) return existing;
-  }
-  const fresh = randomBytes(16).toString('hex');
-  writeFileSync(file, fresh, { encoding: 'utf8', flag: 'wx' });
-  return fresh;
-}
-
-/**
- * Read the persisted per-`dataDir` node identity *without* creating one
+ * Read the persisted per-`dataDir` instance identity *without* creating one
  * if missing. Returns the empty string if the file does not exist, is
- * unreadable, or contains a value that does not match the canonical
- * 32-hex shape. Used by writer-only consumers (the skeleton's
+ * unreadable, or contains invalid JSON. Used by writer-only consumers (the skeleton's
  * writer-only sync stub) that need to know "what id is the daemon
  * using for this dataDir?" but must not race the daemon for file
  * creation.
  */
 export function peekNodeId(dataDir: string): string {
-  try {
-    const file = join(dataDir, NODE_ID_FILENAME);
-    if (!existsSync(file)) return '';
-    const existing = readFileSync(file, 'utf8').trim().toLowerCase();
-    return NODE_ID_RE.test(existing) ? existing : '';
-  } catch {
-    return '';
-  }
+  return peekStoredNodeId(dataDir);
 }
+
+export { peekInstancePublicKey };
 
 export async function start(
   log: Log,
@@ -269,6 +238,7 @@ export async function start(
     return {
       friends,
       serveProfilePublicKeys: [...servedSet],
+      instancePublicKey: '',
       peerId: '',
       activeProfilePublicKey: activeProfile,
       snapshot: () => ({ inflightInbound: 0, inflightOutbound: 0, connectedPeers: 0 }),
@@ -290,11 +260,16 @@ export async function start(
   }
 
   const releaseDataDirLock = acquireSyncLock(options.blockStorageRoot);
-  // `peerId` here is the dataDir-derived node identity (DISC-26 loopback
-  // key). Stable across process restarts; collides only when two processes
-  // genuinely share the same on-disk log — which is also caught by the
-  // dataDir lock above and therefore never reaches this point in practice.
   const peerId = loadOrCreateNodeId(options.blockStorageRoot);
+  const instance = loadOrCreateInstanceIdentity(options.blockStorageRoot);
+  const instancePublicKey = instance.publicKey;
+  const receptionWithRepair = log.reception as typeof log.reception & {
+    repairFromInventory?: () => Promise<{ appended: number }>;
+  };
+  if (typeof receptionWithRepair.repairFromInventory === 'function') {
+    await receptionWithRepair.repairFromInventory();
+  }
+  const fetchCursors = createFetchCursorStore(options.blockStorageRoot);
   const authorizedRemoteProfiles = new Set<string>([...servedSet, ...friendSet]);
   // Default to mDNS+Hyperswarm so peers find each other across both LAN and
   // WAN out of the box. Benchmarks that want LAN-only TCP for max throughput
@@ -307,6 +282,7 @@ export async function start(
   const backends = [
     createMdnsDiscovery({
       peerId,
+      instancePublicKey,
       localProfilePublicKeys: [...servedSet],
       activeProfilePublicKey: activeProfile,
       friendProfileKeys: friendSet,
@@ -383,18 +359,19 @@ export async function start(
           return;
         }
 
-        const { remoteProfile, remotePeerId } = await exchangeFriendHandshake(duplex, {
+        const { remoteProfile, remotePeerId, remoteInstancePublicKey } = await exchangeFriendHandshake(duplex, {
           localProfilePublicKey: localProfileForAssoc,
           localPeerId: peerId,
+          localInstancePublicKey: instancePublicKey,
           subject: profileSubject(associationProfile),
           allowedRemoteProfiles: authorizedRemoteProfiles,
         });
         remoteProfileHint = remoteProfile;
 
-        // Pair key now includes the remote peerId so two sibling devices
-        // (same profile, different peerId, DISC-26) each get their own
+        // Pair key includes the remote instance so two sibling devices
+        // (same profile, different dataDir instance) each get their own
         // connecting-pair slot and can run in parallel.
-        const pairKey = `${localProfileForAssoc}:${remoteProfile}:${remotePeerId}`;
+        const pairKey = `${localProfileForAssoc}:${remoteProfile}:${remoteInstancePublicKey}`;
         if (connectingPairs.has(pairKey)) {
           duplex.close();
           return;
@@ -412,9 +389,15 @@ export async function start(
           log,
           remoteProfile,
           remotePeerId,
+          remoteInstancePublicKey,
           duplex,
           {
             blockStorageRoot: storageRoot,
+            initialFetchCursor: await fetchCursors.get(remoteProfile, remoteInstancePublicKey),
+            onFetchCursorCheckpoint: (cursor) =>
+              fetchCursors.put(remoteProfile, remoteInstancePublicKey, cursor).catch((err) =>
+                logSyncError('fetchCursorCheckpoint', err),
+              ),
             ...(storageRoot
               ? { diskBlockStream: createNodeDiskBlockStreamFactory(storageRoot) }
               : {}),
@@ -426,6 +409,7 @@ export async function start(
           await appendBenchMarker(log, 'friend-session-attached', {
             remote: remoteProfile.slice(0, 16),
             remotePeerId: remotePeerId.slice(0, 16),
+            remoteInstance: remoteInstancePublicKey.slice(0, 16),
             localProfile: localProfileForAssoc.slice(0, 16),
             sibling: remoteProfile === localProfileForAssoc,
           });
@@ -441,6 +425,7 @@ export async function start(
             kind: 'peer-connected',
             at: Date.now(),
             remoteProfilePublicKey: remoteProfile,
+            remoteInstancePublicKey,
             remotePeerId,
             transportLabel: discovered.label,
             role:
@@ -481,6 +466,7 @@ export async function start(
           reason: classified.tag,
           attempts: attempt,
           remoteProfilePublicKey: remoteProfileHint ?? '',
+          remoteInstancePublicKey: '',
           remotePeerId: '',
         });
         if (pairKeyOptimistic !== null) {
@@ -524,6 +510,7 @@ export async function start(
   return {
     friends,
     serveProfilePublicKeys: [...servedSet],
+    instancePublicKey,
     peerId,
     activeProfilePublicKey: activeProfile,
     snapshot: (): SyncSnapshot => ({
@@ -534,6 +521,7 @@ export async function start(
     peers: (): readonly ConnectedPeer[] =>
       friendSessions.liveEntries().map((entry) => ({
         remoteProfilePublicKey: entry.remoteProfilePublicKey,
+        remoteInstancePublicKey: entry.remoteInstancePublicKey,
         remotePeerId: entry.remotePeerId,
         transportLabel: entry.transportLabel,
         localAssociationProfile: entry.localAssociationProfile,

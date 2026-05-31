@@ -41,6 +41,8 @@ export interface PeerConnectedEvent {
   /** Epoch ms (`Date.now()` at emission). */
   readonly at: number;
   readonly remoteProfilePublicKey: string;
+  readonly remoteInstancePublicKey: string;
+  /** Deprecated API alias for `remoteInstancePublicKey`. */
   readonly remotePeerId: string;
   readonly transportLabel: string;
   /** Local-profile classification: sibling = same profile as us, friend = different. */
@@ -52,6 +54,8 @@ export interface PeerDisconnectedEvent {
   readonly kind: 'peer-disconnected';
   readonly at: number;
   readonly remoteProfilePublicKey: string;
+  readonly remoteInstancePublicKey: string;
+  /** Deprecated API alias for `remoteInstancePublicKey`. */
   readonly remotePeerId: string;
   readonly transportLabel: string;
 }
@@ -75,6 +79,7 @@ export interface PeerConnectFailedEvent {
    * the failure happened before identity was established.
    */
   readonly remoteProfilePublicKey: string;
+  readonly remoteInstancePublicKey?: string;
   readonly remotePeerId: string;
 }
 
@@ -86,6 +91,8 @@ export interface BlockSentEvent {
   readonly bytes: number;
   /** Remote profile this block was sent to. */
   readonly toProfile: string;
+  readonly toInstancePublicKey: string;
+  /** Deprecated API alias for `toInstancePublicKey`. */
   readonly toPeerId: string;
 }
 
@@ -96,6 +103,8 @@ export interface BlockReceivedEvent {
   readonly blockHash: string;
   readonly bytes: number;
   readonly fromProfile: string;
+  readonly fromInstancePublicKey: string;
+  /** Deprecated API alias for `fromInstancePublicKey`. */
   readonly fromPeerId: string;
 }
 
@@ -108,6 +117,8 @@ export interface EventReceivedEvent {
   readonly channel: string;
   readonly bytes: number;
   readonly fromProfile: string;
+  readonly fromInstancePublicKey: string;
+  /** Deprecated API alias for `fromInstancePublicKey`. */
   readonly fromPeerId: string;
 }
 
@@ -158,7 +169,7 @@ export class SyncEventBus {
  * surface to emit block/event activity against.
  *
  * Without this adapter the peer-loop would need to thread
- * `(remoteProfile, remotePeerId)` through every hook point. By baking
+ * `(remoteProfile, remoteInstancePublicKey)` through every hook point. By baking
  * them into the emitter at session attach time we keep the peer-loop's
  * signature unchanged across the observability addition.
  */

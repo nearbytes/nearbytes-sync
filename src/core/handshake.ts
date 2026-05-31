@@ -11,7 +11,7 @@ export type SyncHandshakeFailureCode =
   | 'unsupported-protocol'
   | 'duplicate-nonce'
   | 'unauthorized-profile'
-  | 'process-loopback';
+  | 'instance-loopback';
 
 /**
  * Expected handshake failure (timeout, race, policy). Callers MUST NOT
@@ -33,6 +33,7 @@ export class SyncHandshakeError extends Error {
 export interface FriendHandshakeOptions {
   readonly localProfilePublicKey: string;
   readonly localPeerId: string;
+  readonly localInstancePublicKey: string;
   readonly subject: Subject;
   /**
    * Set of remote profile public keys (lower-case hex) we accept as the
@@ -46,13 +47,13 @@ export interface FriendHandshakeOptions {
 
 export interface FriendHandshakeResult {
   readonly remoteProfile: string;
-  /** Empty string when the remote did not advertise a peerId (pre-DISC-26 peer). */
   readonly remotePeerId: string;
+  readonly remoteInstancePublicKey: string;
 }
 
 /**
  * Exchanges {@code hello} on a new duplex before anti-entropy.
- * Resolves with the verified remote profile public key and per-process peerId.
+ * Resolves with the verified remote profile public key and instance public key.
  */
 export function exchangeFriendHandshake(
   peer: DuplexPeer,
@@ -60,6 +61,7 @@ export function exchangeFriendHandshake(
 ): Promise<FriendHandshakeResult> {
   const localProfile = options.localProfilePublicKey.toLowerCase();
   const localPeerId = options.localPeerId.toLowerCase();
+  const localInstancePublicKey = options.localInstancePublicKey.toLowerCase();
   const sessionNonce = randomBytes(16).toString('hex');
   const seenNonces = new Set<string>();
   let remoteResult: FriendHandshakeResult | null = null;
@@ -96,6 +98,7 @@ export function exchangeFriendHandshake(
         sessionNonce,
         senderProfile: localProfile,
         senderPeerId: localPeerId,
+        senderInstancePublicKey: localInstancePublicKey,
       };
       peer.write(encodeFrame(hello));
       localHelloSent = true;
@@ -149,20 +152,47 @@ export function exchangeFriendHandshake(
         return;
       }
       const remotePeerId = msg.senderPeerId?.toLowerCase() ?? '';
-      if (remote === localProfile && remotePeerId === localPeerId) {
+      if (remotePeerId === '') {
         detachHandshake();
         clearTimer();
         peer.close();
         reject(
           new SyncHandshakeError(
-            'process-loopback',
-            'sync handshake: process-level loopback',
+            'unauthorized-profile',
+            'sync handshake: remote did not advertise peer id',
             false,
           ),
         );
         return;
       }
-      remoteResult = { remoteProfile: remote, remotePeerId };
+      const remoteInstancePublicKey = msg.senderInstancePublicKey?.toLowerCase() ?? '';
+      if (remoteInstancePublicKey === '') {
+        detachHandshake();
+        clearTimer();
+        peer.close();
+        reject(
+          new SyncHandshakeError(
+            'unauthorized-profile',
+            'sync handshake: remote did not advertise instance identity',
+            false,
+          ),
+        );
+        return;
+      }
+      if (remote === localProfile && remoteInstancePublicKey === localInstancePublicKey) {
+        detachHandshake();
+        clearTimer();
+        peer.close();
+        reject(
+          new SyncHandshakeError(
+            'instance-loopback',
+            'sync handshake: instance-level loopback',
+            false,
+          ),
+        );
+        return;
+      }
+      remoteResult = { remoteProfile: remote, remotePeerId, remoteInstancePublicKey };
       tryComplete();
     };
 

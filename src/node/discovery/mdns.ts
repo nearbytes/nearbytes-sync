@@ -40,6 +40,7 @@ function duplexFromNetSocket(socket: Socket): DuplexPeer {
  */
 export function createMdnsDiscovery(options: {
   readonly peerId: string;
+  readonly instancePublicKey: string;
   readonly localProfilePublicKeys: readonly string[];
   readonly activeProfilePublicKey: string;
   readonly friendProfileKeys: ReadonlySet<string>;
@@ -102,6 +103,7 @@ export function createMdnsDiscovery(options: {
       for (const entry of tcpServers) {
         const txt = buildLanDiscoveryTxtRecord({
           peerId: options.peerId,
+          instancePublicKey: options.instancePublicKey,
           syncPort: entry.port,
           profilePublicKey: entry.profile,
         });
@@ -127,7 +129,7 @@ export function createMdnsDiscovery(options: {
         if (!parsed || parsed.alpn !== LAN_TRANSPORT_PROFILE_ID) {
           return;
         }
-        if (parsed.peerId === options.peerId) {
+        if (parsed.instancePublicKey === options.instancePublicKey) {
           return;
         }
         if (!isAuthorizedRemoteProfile(parsed.profilePublicKey)) {
@@ -135,11 +137,18 @@ export function createMdnsDiscovery(options: {
         }
         const isSibling = localProfileSet.has(parsed.profilePublicKey);
         const dialAsProfile = isSibling ? parsed.profilePublicKey : activeProfile;
-        if (!shouldInitiateSyncTcp(dialAsProfile, parsed.profilePublicKey, options.peerId, parsed.peerId)) {
+        if (
+          !shouldInitiateSyncTcp(
+            dialAsProfile,
+            parsed.profilePublicKey,
+            options.instancePublicKey,
+            parsed.instancePublicKey,
+          )
+        ) {
           return;
         }
         const host = service.addresses.find((a: string) => !a.includes(':')) ?? service.addresses[0];
-        const key = `${parsed.profilePublicKey}:${parsed.peerId}:${host}:${parsed.syncPort}`;
+        const key = `${parsed.profilePublicKey}:${parsed.instancePublicKey}:${host}:${parsed.syncPort}`;
         if (seenTcp.has(key)) {
           return;
         }
@@ -152,6 +161,7 @@ export function createMdnsDiscovery(options: {
           profilePublicKey: parsed.profilePublicKey,
           associationProfile: parsed.profilePublicKey,
           remotePeerId: parsed.peerId,
+          remoteInstancePublicKey: parsed.instancePublicKey,
         });
       });
 
@@ -165,6 +175,7 @@ export function createMdnsDiscovery(options: {
         const announcement = JSON.stringify({
           pv: '0.4',
           peer: options.peerId,
+          inst: options.instancePublicKey,
           port: entry.port,
           alpn: LAN_TRANSPORT_PROFILE_ID,
           prof: entry.profile,

@@ -5,7 +5,7 @@ import type { PeerSessionEventEmitter, SyncEventBus } from './syncEvents.js';
 
 export interface FriendSessionEntry {
   readonly remoteProfilePublicKey: string;
-  /** Empty string for legacy peers that did not advertise a peerId (pre-DISC-26). */
+  readonly remoteInstancePublicKey: string;
   readonly remotePeerId: string;
   readonly transportLabel: string;
   /** Wall-clock when the session became alive (after handshake). */
@@ -32,8 +32,8 @@ function transportPreference(label: string): number {
 }
 
 /**
- * Sessions are keyed by `(remoteProfile, remotePeerId)` (`sync-discovery-v1.md`
- * DISC-26) so two sibling devices that share the same identity each get their
+ * Sessions are keyed by `(remoteProfile, remoteInstancePublicKey)`
+ * (`sync-discovery-v1.md` DISC-26/27) so two sibling devices that share the same profile each get their
  * own session entry. Duplicate connections to the **same** sibling are still
  * deduped: a higher-preference transport (mDNS TCP) wins over a lower one.
  */
@@ -69,19 +69,20 @@ export class FriendSessionRegistry {
     return n;
   }
 
-  private sessionKey(remoteProfile: string, remotePeerId: string): string {
-    return `${remoteProfile.toLowerCase()}|${remotePeerId.toLowerCase()}`;
+  private sessionKey(remoteProfile: string, remoteInstancePublicKey: string): string {
+    return `${remoteProfile.toLowerCase()}|${remoteInstancePublicKey.toLowerCase()}`;
   }
 
   /**
    * Build a per-session event emitter that bakes the remote identity
    * into every emission. We construct one of these *per attach* (not
    * per registry) so the peer-loop's hook sites can stay context-free
-   * even though every emission must carry the remote profile/peerId.
+   * even though every emission must carry the remote profile/instance.
    */
   private makeSessionEmitter(
     remote: string,
-    remotePid: string,
+    remotePeerId: string,
+    remoteInstance: string,
   ): PeerSessionEventEmitter | undefined {
     const bus = this.bus;
     if (bus === undefined) return undefined;
@@ -93,7 +94,8 @@ export class FriendSessionRegistry {
           blockHash,
           bytes,
           toProfile: remote,
-          toPeerId: remotePid,
+          toPeerId: remotePeerId,
+          toInstancePublicKey: remoteInstance,
         });
       },
       blockReceived: (blockHash, bytes) => {
@@ -103,7 +105,8 @@ export class FriendSessionRegistry {
           blockHash,
           bytes,
           fromProfile: remote,
-          fromPeerId: remotePid,
+          fromPeerId: remotePeerId,
+          fromInstancePublicKey: remoteInstance,
         });
       },
       eventReceived: (channel, eventHash, bytes) => {
@@ -114,7 +117,8 @@ export class FriendSessionRegistry {
           channel,
           bytes,
           fromProfile: remote,
-          fromPeerId: remotePid,
+          fromPeerId: remotePeerId,
+          fromInstancePublicKey: remoteInstance,
         });
       },
     };
@@ -124,6 +128,7 @@ export class FriendSessionRegistry {
     log: Log,
     remoteProfilePublicKey: string,
     remotePeerId: string,
+    remoteInstancePublicKey: string,
     peer: DuplexPeer,
     sessionOptions: AttachPeerSessionOptions = {},
     transportLabel = 'unknown',
@@ -131,7 +136,8 @@ export class FriendSessionRegistry {
   ): { readonly entry: FriendSessionEntry; readonly created: boolean } {
     const remote = remoteProfilePublicKey.toLowerCase();
     const remotePid = remotePeerId.toLowerCase();
-    const key = this.sessionKey(remote, remotePid);
+    const remoteInstance = remoteInstancePublicKey.toLowerCase();
+    const key = this.sessionKey(remote, remoteInstance);
     const existing = this.sessions.get(key);
     if (existing !== undefined && existing.isAlive()) {
       if (transportPreference(transportLabel) >= transportPreference(existing.transportLabel)) {
@@ -151,7 +157,7 @@ export class FriendSessionRegistry {
     const subject = profileSubject(remote);
     let alive = true;
     let entry: FriendSessionEntry;
-    const sessionEmitter = this.makeSessionEmitter(remote, remotePid);
+    const sessionEmitter = this.makeSessionEmitter(remote, remotePid, remoteInstance);
     const optionsWithEvents: AttachPeerSessionOptions =
       sessionEmitter !== undefined
         ? { ...sessionOptions, events: sessionEmitter }
@@ -168,12 +174,14 @@ export class FriendSessionRegistry {
           at: Date.now(),
           remoteProfilePublicKey: remote,
           remotePeerId: remotePid,
+          remoteInstancePublicKey: remoteInstance,
           transportLabel,
         });
       }
     }, optionsWithEvents);
     entry = {
       remoteProfilePublicKey: remote,
+      remoteInstancePublicKey: remoteInstance,
       remotePeerId: remotePid,
       transportLabel,
       connectedAt: new Date(),

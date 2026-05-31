@@ -18,21 +18,20 @@ const SMALL_FILE_INLINE_BYTES = 256 * 1024 * 1024;
  * lower profile hex dials (same rule as before). For same-identity sibling
  * pairs (`local.profile == remote.profile`, `sync-discovery-v1.md` DISC-26)
  * profile equality cannot break the tie, so we fall through to the
- * `peerId` lex order, which is always distinct because `peerId` is a
- * per-process random 16-byte hex string.
+ * instance-public-key lex order, which is distinct for different dataDirs.
  */
 export function shouldInitiateSyncTcp(
   localProfileHex: string,
   remoteProfileHex: string,
-  localPeerId: string,
-  remotePeerId: string,
+  localInstancePublicKey: string,
+  remoteInstancePublicKey: string,
 ): boolean {
   const localProfile = localProfileHex.toLowerCase();
   const remoteProfile = remoteProfileHex.toLowerCase();
   if (localProfile !== remoteProfile) {
     return localProfile < remoteProfile;
   }
-  return localPeerId.toLowerCase() < remotePeerId.toLowerCase();
+  return localInstancePublicKey.toLowerCase() < remoteInstancePublicKey.toLowerCase();
 }
 
 export interface PumpResult {

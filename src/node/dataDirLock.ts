@@ -14,10 +14,10 @@
  * exactly once), so multiple processes MAY write into the same dataDir.
  *
  * What we are protecting against is *duplicate sync*: two daemons joining
- * the same Hyperswarm topic from the same node identity would announce the
- * same `peerId` twice, double the friend-session bookkeeping at each peer,
+ * the same Hyperswarm topic from the same instance identity would announce the
+ * same instance public key twice, double the friend-session bookkeeping at each peer,
  * waste bandwidth, and confuse the DISC-26 sibling carriage logic that
- * relies on `peerId` to dedupe loopback.
+ * relies on instance identity to dedupe loopback.
  *
  * ## On-disk shape
  *

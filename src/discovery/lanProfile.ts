@@ -12,6 +12,7 @@ export const LAN_MULTICAST_ANNOUNCE_MS = 5_000;
 export interface LanDiscoveryTxtRecord {
   readonly pv: typeof LAN_DISCOVERY_PROTOCOL_VERSION;
   readonly peer: string;
+  readonly inst: string;
   readonly alpn: typeof LAN_TRANSPORT_PROFILE_ID;
   readonly caps: string;
   readonly syncPort?: string;
@@ -23,6 +24,7 @@ export interface LanDiscoveryTxtRecord {
 
 export function buildLanDiscoveryTxtRecord(input: {
   readonly peerId: string;
+  readonly instancePublicKey: string;
   readonly syncPort: number;
   readonly profilePublicKey: string;
   readonly capabilities?: readonly string[];
@@ -30,7 +32,8 @@ export function buildLanDiscoveryTxtRecord(input: {
   const caps = (input.capabilities ?? ['sync-v1', 'global-delta']).join(',');
   return {
     pv: LAN_DISCOVERY_PROTOCOL_VERSION,
-    peer: input.peerId.trim(),
+    peer: input.peerId.trim().toLowerCase(),
+    inst: input.instancePublicKey.trim().toLowerCase(),
     alpn: LAN_TRANSPORT_PROFILE_ID,
     caps,
     syncPort: String(input.syncPort),
@@ -40,14 +43,27 @@ export function buildLanDiscoveryTxtRecord(input: {
 
 export function parseLanDiscoveryTxtRecord(
   value: Record<string, unknown>,
-): { peerId: string; syncPort: number; alpn: string; profilePublicKey: string } | null {
-  const peerId = typeof value.peer === 'string' ? value.peer.trim() : '';
+): {
+  peerId: string;
+  instancePublicKey: string;
+  syncPort: number;
+  alpn: string;
+  profilePublicKey: string;
+} | null {
+  const peerId = typeof value.peer === 'string' ? value.peer.trim().toLowerCase() : '';
+  const instancePublicKey = typeof value.inst === 'string' ? value.inst.trim().toLowerCase() : '';
   const alpn = typeof value.alpn === 'string' ? value.alpn.trim() : '';
   const syncPortRaw = typeof value.syncPort === 'string' ? value.syncPort.trim() : '';
   const profilePublicKey = typeof value.prof === 'string' ? value.prof.trim().toLowerCase() : '';
   const syncPort = Number.parseInt(syncPortRaw, 10);
-  if (peerId === '' || alpn === '' || !Number.isFinite(syncPort) || profilePublicKey === '') {
+  if (
+    peerId === '' ||
+    instancePublicKey === '' ||
+    alpn === '' ||
+    !Number.isFinite(syncPort) ||
+    profilePublicKey === ''
+  ) {
     return null;
   }
-  return { peerId, syncPort, alpn, profilePublicKey };
+  return { peerId, instancePublicKey, syncPort, alpn, profilePublicKey };
 }

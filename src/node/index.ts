@@ -1,5 +1,6 @@
 export {
   start,
+  peekInstancePublicKey,
   peekNodeId,
   type SyncHandle,
   type SyncSnapshot,

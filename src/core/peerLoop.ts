@@ -80,6 +80,10 @@ export interface AttachPeerSessionOptions {
   readonly blockStorageRoot?: string;
   /** When set with {@link blockStorageRoot}, inbound blocks stream to disk instead of RAM. */
   readonly diskBlockStream?: DiskBlockStreamSinkFactory;
+  /** Stored cursor into this remote endpoint's reception stream. */
+  readonly initialFetchCursor?: string;
+  /** Called after a remote `have` page has been processed and can be checkpointed. */
+  readonly onFetchCursorCheckpoint?: (cursor: string) => void | Promise<void>;
   /**
    * Observability sink for wire-level activity on this session. The
    * caller (typically `FriendSessionRegistry.attach`) bakes the remote
@@ -252,6 +256,9 @@ export function attachPeerSession(
   const diskBlockStream = options.diskBlockStream;
   const sessionEvents: PeerSessionEventEmitter =
     options.events ?? NOOP_PEER_SESSION_EVENT_EMITTER;
+  const checkpointFetchCursor = async (cursor: string): Promise<void> => {
+    await options.onFetchCursorCheckpoint?.(cursor);
+  };
   let inboundWire = Promise.resolve();
   let outboundWire = Promise.resolve();
   const runInbound = (fn: () => void | Promise<void>): void => {
@@ -408,8 +415,12 @@ export function attachPeerSession(
         sendWants(wants);
       }
       if (msg.more && msg.nextCursor) {
+        await checkpointFetchCursor(msg.nextCursor);
         requestGlobalDelta(msg.nextCursor);
       } else {
+        if (msg.nextCursor) {
+          await checkpointFetchCursor(msg.nextCursor);
+        }
         scheduleOrphanRepair();
       }
       return;
@@ -419,6 +430,9 @@ export function attachPeerSession(
       const { blocks, events } = partitionWantRefs(msg.objects);
       for (const ref of blocks) {
         if (ref.kind !== 'block') {
+          continue;
+        }
+        if (!(await log.blocks.has(ref.hash as Hash))) {
           continue;
         }
         if (storageRoot) {
@@ -712,9 +726,17 @@ export function attachPeerSession(
 
   send({
     type: 'subscribe',
-    delta: { type: 'delta', subject, mode: 'global', limit: 256 },
+    delta: {
+      type: 'delta',
+      subject,
+      mode: 'global',
+      limit: 256,
+      ...(options.initialFetchCursor !== undefined
+        ? { cursor: options.initialFetchCursor }
+        : {}),
+    },
   });
-  requestGlobalDelta();
+  requestGlobalDelta(options.initialFetchCursor);
 
   const stop = (): void => {
     unregister();

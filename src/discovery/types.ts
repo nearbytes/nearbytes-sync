@@ -29,11 +29,12 @@ export type DiscoveredPeer =
       /** Profile owning the topic this connection is on (lower-case hex). */
       readonly associationProfile: string;
       /**
-       * Per-process random hex identifier of the remote node, learned from
-       * the LAN announcement (`sync-discovery-v1.md` DISC-26). Used by the
+       * Per-dataDir instance public key of the remote endpoint, learned from
+       * the LAN announcement (`sync-discovery-v1.md` DISC-26/27). Used by the
        * sibling-aware TCP dial tiebreaker.
        */
       readonly remotePeerId: string;
+      readonly remoteInstancePublicKey: string;
     };
 
 export interface PeerDiscovery {
