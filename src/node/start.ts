@@ -263,12 +263,6 @@ export async function start(
   const peerId = loadOrCreateNodeId(options.blockStorageRoot);
   const instance = loadOrCreateInstanceIdentity(options.blockStorageRoot);
   const instancePublicKey = instance.publicKey;
-  const receptionWithRepair = log.reception as typeof log.reception & {
-    repairFromInventory?: () => Promise<{ appended: number }>;
-  };
-  if (typeof receptionWithRepair.repairFromInventory === 'function') {
-    await receptionWithRepair.repairFromInventory();
-  }
   const fetchCursors = createFetchCursorStore(options.blockStorageRoot);
   const authorizedRemoteProfiles = new Set<string>([...servedSet, ...friendSet]);
   // Default to mDNS+Hyperswarm so peers find each other across both LAN and
