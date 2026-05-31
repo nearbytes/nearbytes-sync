@@ -6,6 +6,10 @@ import { blockPath, type Log, type ReceptionObjectRef } from 'nearbytes-log';
 import { publicKeyFromHex, serializeEvent } from 'nearbytes-log';
 import { acceptData } from './acceptData.js';
 import {
+  missingInboundEventDependencies,
+  repairMissingEventDependencyWants,
+} from './eventDependencies.js';
+import {
   BLOCK_STREAM_WRITE_SLICE_BYTES,
   createWireDecoder,
   encodeBlockStreamBegin,
@@ -340,6 +344,30 @@ export function attachPeerSession(
     }
   };
 
+  /**
+   * After anti-entropy quiesces, pull causal parents for any events we already
+   * hold but cannot chain (global reception pagination may never re-offer them).
+   * Chains on the inbound serial queue so repair never races a half-handled frame.
+   */
+  let orphanRepairChain = Promise.resolve();
+  const scheduleOrphanRepair = (): void => {
+    orphanRepairChain = orphanRepairChain
+      .then(async () => {
+        await inboundWire;
+        const repair = await repairMissingEventDependencyWants(log);
+        if (repair.length === 0) {
+          return;
+        }
+        const wants = await missingRefs(log, repair);
+        if (wants.length > 0) {
+          sendWants(wants);
+        }
+      })
+      .catch((err) => {
+        logSyncError('orphanRepair', err);
+      });
+  };
+
   const announcer: LocalHaveAnnouncer = {
     pushLocalHave(refs) {
       void sendHave(refs, false);
@@ -381,6 +409,8 @@ export function attachPeerSession(
       }
       if (msg.more && msg.nextCursor) {
         requestGlobalDelta(msg.nextCursor);
+      } else {
+        scheduleOrphanRepair();
       }
       return;
     }
@@ -431,6 +461,18 @@ export function attachPeerSession(
           msg.object.hash,
           msg.bytes.byteLength,
         );
+        const deps = await missingInboundEventDependencies(
+          log,
+          msg.object.channel,
+          msg.bytes,
+        );
+        if (deps.length > 0) {
+          const wants = await missingRefs(log, deps);
+          if (wants.length > 0) {
+            sendWants(wants);
+          }
+        }
+        scheduleOrphanRepair();
       }
     }
   };
@@ -448,6 +490,7 @@ export function attachPeerSession(
         bytes: bytes.byteLength,
       });
       sessionEvents.blockReceived(hash, bytes.byteLength);
+      scheduleOrphanRepair();
     }
   };
 
@@ -501,6 +544,7 @@ export function attachPeerSession(
       bytes,
     });
     sessionEvents.blockReceived(hash, bytes);
+    scheduleOrphanRepair();
   };
 
   const finishIncomingStream = async (): Promise<void> => {
