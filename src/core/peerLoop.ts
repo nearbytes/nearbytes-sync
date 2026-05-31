@@ -169,6 +169,13 @@ async function pumpBlockStream(peer: DuplexPeer, bytes: Uint8Array): Promise<voi
   }
 }
 
+function isMissingLocalBlockError(err: unknown): boolean {
+  if (!(err instanceof Error) || !('code' in err)) {
+    return false;
+  }
+  return (err as NodeJS.ErrnoException).code === 'ENOENT';
+}
+
 function sendBlockStream(
   log: Log,
   runOutbound: (fn: () => void | Promise<void>) => void,
@@ -217,6 +224,9 @@ function sendBlockStream(
         sessionEvents.blockSent(ref.hash, pumped.bytes);
       }
     } catch (err) {
+      if (isMissingLocalBlockError(err)) {
+        return;
+      }
       logSyncError(`sendBlockStream:${ref.hash.slice(0, 16)}`, err);
     } finally {
       outboundCounter.end();
