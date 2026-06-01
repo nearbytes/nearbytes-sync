@@ -1,12 +1,13 @@
 import { SyncHandshakeError, type SyncHandshakeFailureCode } from './core/handshake.js';
+import { syncEmit } from './syncDebugLog.js';
 
 /** Log sync-layer failures to stderr (never swallow silently). */
 export function logSyncError(scope: string, err: unknown): void {
   if (err instanceof Error) {
-    console.error(`[nearbytes-sync:${scope}]`, err.stack ?? err.message);
+    syncEmit(scope, err.stack ?? err.message);
     return;
   }
-  console.error(`[nearbytes-sync:${scope}]`, err);
+  syncEmit(scope, String(err));
 }
 
 /**
@@ -98,7 +99,7 @@ function emitExpectedDisconnect(scope: string, tag: string): void {
     existing.count += 1;
     return;
   }
-  console.error(`[nearbytes-sync:${scope}] disconnected (${tag})`);
+  syncEmit(scope, `disconnected (${tag})`);
   const timer = setTimeout(() => {
     const entry = coalesceState.get(key);
     coalesceState.delete(key);
@@ -107,9 +108,7 @@ function emitExpectedDisconnect(scope: string, tag: string): void {
     }
     const extra = entry.count - 1;
     const elapsedS = Math.max(1, Math.round((Date.now() - entry.firstAt) / 1000));
-    console.error(
-      `[nearbytes-sync:${scope}] disconnected (${tag}) — and ${extra} more in the last ${elapsedS}s`,
-    );
+    syncEmit(scope, `disconnected (${tag}) — and ${extra} more in the last ${elapsedS}s`);
   }, COALESCE_WINDOW_MS);
   if (typeof timer.unref === 'function') {
     timer.unref();
@@ -216,7 +215,7 @@ function emitFriendConnectLine(scope: string, line: string): void {
     existing.count += 1;
     return;
   }
-  console.error(`[nearbytes-sync:${scope}] ${line}`);
+  syncEmit(scope, line);
   const timer = setTimeout(() => {
     const entry = coalesceState.get(key);
     coalesceState.delete(key);
@@ -225,9 +224,7 @@ function emitFriendConnectLine(scope: string, line: string): void {
     }
     const extra = entry.count - 1;
     const elapsedS = Math.max(1, Math.round((Date.now() - entry.firstAt) / 1000));
-    console.error(
-      `[nearbytes-sync:${scope}] ${line} — and ${extra} more in the last ${elapsedS}s`,
-    );
+    syncEmit(scope, `${line} — and ${extra} more in the last ${elapsedS}s`);
   }, COALESCE_WINDOW_MS);
   if (typeof timer.unref === 'function') {
     timer.unref();

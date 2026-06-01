@@ -19,6 +19,7 @@ import {
 import type { ObjectRef, Subject, SyncMessage } from './types.js';
 import { appendBenchMarker } from '../benchMarker.js';
 import { logSyncError } from '../logSyncError.js';
+import { syncDebugLine } from '../syncDebugLog.js';
 import { registerLocalHaveAnnouncer, type LocalHaveAnnouncer } from './sessionRegistry.js';
 import { inflightBlockRegistry, outboundBlockStreamCounter } from './inflightBlocks.js';
 import {
@@ -381,9 +382,15 @@ export function attachPeerSession(
       more,
       ...(effectiveNext !== undefined ? { nextCursor: effectiveNext } : {}),
     });
+    syncDebugLine(
+      'wire',
+      `have → objects=${objects.length} more=${more}` +
+        (effectiveNext !== undefined ? ` next=${effectiveNext}` : ''),
+    );
   };
 
   const requestGlobalDelta = (cursor?: string): void => {
+    syncDebugLine('wire', `delta → global cursor=${cursor ?? '(start)'} limit=256`);
     send({
       type: 'delta',
       subject,
@@ -396,9 +403,11 @@ export function attachPeerSession(
   const sendWants = (refs: readonly ObjectRef[]): void => {
     const { blocks, events } = partitionWantRefs(refs);
     if (blocks.length > 0) {
+      syncDebugLine('wire', `want → blocks=${blocks.length}`);
       send({ type: 'want', objects: blocks });
     }
     if (events.length > 0) {
+      syncDebugLine('wire', `want → events=${events.length}`);
       send({ type: 'want', objects: events });
     }
   };
@@ -494,6 +503,11 @@ export function attachPeerSession(
     }
 
     if (msg.type === 'have') {
+      syncDebugLine(
+        'wire',
+        `have ← objects=${msg.objects.length} more=${msg.more}` +
+          (msg.nextCursor !== undefined ? ` next=${msg.nextCursor}` : ''),
+      );
       const candidates = await missingRefs(log, msg.objects);
       const wants: ObjectRef[] = [];
       for (const ref of candidates) {
@@ -541,6 +555,7 @@ export function attachPeerSession(
           ) {
             lastFetchedCursor = undefined;
             pendingPageCursor = undefined;
+            syncDebugLine('wire', 'have ← empty page — stale fetch cursor, restart delta from start');
             requestGlobalDelta(undefined);
           } else if (
             !emptyCatchupRewound &&
@@ -550,6 +565,7 @@ export function attachPeerSession(
             emptyCatchupRewound = true;
             lastFetchedCursor = undefined;
             pendingPageCursor = undefined;
+            syncDebugLine('wire', 'have ← empty terminal page — rewind fetch cursor once');
             requestGlobalDelta(undefined);
           }
         } else if (msg.nextCursor) {
@@ -563,6 +579,7 @@ export function attachPeerSession(
 
     if (msg.type === 'want') {
       const { blocks, events } = partitionWantRefs(msg.objects);
+      syncDebugLine('wire', `want ← blocks=${blocks.length} events=${events.length}`);
       for (const ref of blocks) {
         if (ref.kind !== 'block') {
           continue;

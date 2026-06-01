@@ -32,6 +32,13 @@ export {
 } from './dataDirLock.js';
 export { runDaemon, type DaemonOptions } from './daemon.js';
 export {
+  configureSyncDebug,
+  syncDebugLine,
+  isSyncVerboseDebugEnabled,
+  formatSyncTimestamp,
+  type SyncDebugSink,
+} from '../syncDebugLog.js';
+export {
   readDaemonConfig,
   defaultDaemonConfigPath,
   defaultDaemonDataDir,
