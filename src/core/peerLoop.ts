@@ -455,24 +455,26 @@ export function attachPeerSession(
     }
     const objects: ObjectRef[] = [];
     let skippedUnavailable = 0;
-    for (const ref of refs) {
-      if (process.env.NBF_PROP_TRACE === '1') {
-        console.error(`[nearbytes-sync] sendHave ref ${ref.kind}`);
-      }
-      const available = await receptionRefLocallyAvailable(log, ref, storageRoot);
-      if (process.env.NBF_PROP_TRACE === '1') {
-        console.error(`[nearbytes-sync] sendHave avail ${ref.kind}=${available}`);
-      }
-      if (!available) {
-        skippedUnavailable += 1;
-        continue;
-      }
-      const wireRef = await toWireRef(log, ref, storageRoot);
-      if (process.env.NBF_PROP_TRACE === '1') {
-        console.error(`[nearbytes-sync] sendHave wire ${ref.kind} ok=${wireRef !== null}`);
-      }
-      if (wireRef !== null) {
-        objects.push(wireRef);
+    const batchSize = 32;
+    for (let i = 0; i < refs.length; i += batchSize) {
+      const batch = refs.slice(i, i + batchSize);
+      const built = await Promise.all(
+        batch.map(async (ref) => {
+          if (!(await receptionRefLocallyAvailable(log, ref, storageRoot))) {
+            return { available: false as const, wire: null };
+          }
+          const wireRef = await toWireRef(log, ref, storageRoot);
+          return { available: true as const, wire: wireRef };
+        }),
+      );
+      for (const entry of built) {
+        if (!entry.available) {
+          skippedUnavailable += 1;
+          continue;
+        }
+        if (entry.wire !== null) {
+          objects.push(entry.wire);
+        }
       }
     }
     if (skippedUnavailable > 0) {

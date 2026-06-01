@@ -32,9 +32,20 @@ export async function listLocalReceptionPage(
   cursor?: string,
 ): Promise<ReceptionListResult> {
   const maxSeq = await readLocalReceptionMaxSeq(storageRoot);
+  let parsedCursor = -1;
+  if (cursor !== undefined && cursor !== '') {
+    parsedCursor = Number.parseInt(cursor, 10);
+    if (!Number.isNaN(parsedCursor) && parsedCursor >= maxSeq) {
+      return { refs: [], more: false, next: String(maxSeq) };
+    }
+  }
   if (useInstantReceptionSync(maxSeq)) {
     const start = cursor === undefined || cursor === '' ? '-1' : cursor;
-    return log.reception.listAfter(start, maxSeq + 1);
+    const limit =
+      start === '-1'
+        ? Math.min(RECEPTION_PAGE_LIMIT, maxSeq + 1)
+        : Math.min(RECEPTION_PAGE_LIMIT, maxSeq - parsedCursor + 1);
+    return log.reception.listAfter(start, limit);
   }
   return log.reception.listAfter(cursor, RECEPTION_PAGE_LIMIT);
 }
