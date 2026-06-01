@@ -55,6 +55,7 @@ export function createMdnsDiscovery(options: {
   let bonjour: InstanceType<typeof Bonjour> | null = null;
   let browser: ReturnType<InstanceType<typeof Bonjour>['find']> | null = null;
   const tcpServers: { profile: string; server: Server; port: number }[] = [];
+  const tcpSockets = new Set<Socket>();
   let multicastSocket: dgram.Socket | null = null;
   let multicastTimer: ReturnType<typeof setInterval> | null = null;
   const seenTcp = new Set<string>();
@@ -112,6 +113,10 @@ export function createMdnsDiscovery(options: {
 
   const startListenerForProfile = async (profile: string): Promise<{ server: Server; port: number }> => {
     const server = createServer((socket) => {
+      tcpSockets.add(socket);
+      socket.on('close', () => {
+        tcpSockets.delete(socket);
+      });
       if (!peerHandler) {
         socket.destroy();
         return;
@@ -248,12 +253,30 @@ export function createMdnsDiscovery(options: {
       }
       browser?.stop();
       browser = null;
-      bonjour?.destroy();
-      bonjour = null;
+      if (bonjour) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 1_000);
+          timer.unref();
+          bonjour!.destroy(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+        bonjour = null;
+      }
+      for (const socket of tcpSockets) {
+        socket.destroy();
+      }
+      tcpSockets.clear();
       while (tcpServers.length > 0) {
         const entry = tcpServers.pop()!;
         await new Promise<void>((resolve, reject) => {
-          entry.server.close((err) => (err ? reject(err) : resolve()));
+          const timer = setTimeout(resolve, 1_000);
+          timer.unref();
+          entry.server.close((err) => {
+            clearTimeout(timer);
+            return err ? reject(err) : resolve();
+          });
         });
       }
     },
