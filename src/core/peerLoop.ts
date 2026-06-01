@@ -413,6 +413,8 @@ export function attachPeerSession(
   let lastFetchedCursor = options.initialFetchCursor;
   /** Page cursor to checkpoint only after outstanding `want`/`data` work finishes. */
   let pendingPageCursor: string | undefined;
+  /** One-shot rewind when a persisted cursor yields empty pages but we may still be behind. */
+  let emptyCatchupRewound = false;
 
   const flushPendingPageCursor = async (): Promise<void> => {
     if (pendingPageCursor === undefined) {
@@ -446,25 +448,25 @@ export function attachPeerSession(
    * When a peer attaches, advertise the tail of our reception journal so a
    * late joiner (or a peer with a stale fetch cursor) still sees recent writes
    * made while it was offline — mutual `delta` alone is not always enough.
+   *
+   * Runs immediately (not behind `inboundWire`) so a joiner's first `subscribe`
+   * cannot win the race and advance a false fetch cursor before we announce.
    */
-  const scheduleProactiveReceptionTail = (): void => {
-    orphanRepairChain = orphanRepairChain
-      .then(async () => {
-        await inboundWire;
-        const maxSeq = await readLocalReceptionMaxSeq(storageRoot);
-        if (maxSeq <= 0) {
-          return;
-        }
-        const window = 256;
-        const start = Math.max(-1, maxSeq - window);
-        const out = await log.reception.listAfter(String(start), window);
-        if (out.refs.length > 0) {
-          await sendHave(out.refs, out.more, out.next);
-        }
-      })
-      .catch((err) => {
-        logSyncError('proactiveReceptionTail', err);
-      });
+  const pushProactiveReceptionTail = (): void => {
+    void (async () => {
+      const maxSeq = await readLocalReceptionMaxSeq(storageRoot);
+      if (maxSeq <= 0) {
+        return;
+      }
+      const window = 256;
+      const start = Math.max(-1, maxSeq - window);
+      const out = await log.reception.listAfter(String(start), window);
+      if (out.refs.length > 0) {
+        await sendHave(out.refs, out.more, out.next);
+      }
+    })().catch((err) => {
+      logSyncError('proactiveReceptionTail', err);
+    });
   };
 
   const announcer: LocalHaveAnnouncer = {
@@ -524,8 +526,6 @@ export function attachPeerSession(
         return;
       }
       if (msg.more && msg.nextCursor) {
-        await checkpointFetchCursor(msg.nextCursor);
-        lastFetchedCursor = msg.nextCursor;
         requestGlobalDelta(msg.nextCursor);
       } else {
         if (msg.objects.length === 0) {
@@ -542,11 +542,15 @@ export function attachPeerSession(
             lastFetchedCursor = undefined;
             pendingPageCursor = undefined;
             requestGlobalDelta(undefined);
-          } else if (msg.nextCursor !== undefined) {
-            await checkpointFetchCursor(msg.nextCursor);
-            lastFetchedCursor = msg.nextCursor;
-          } else if (lastFetchedCursor !== undefined) {
-            requestGlobalDelta(lastFetchedCursor);
+          } else if (
+            !emptyCatchupRewound &&
+            options.initialFetchCursor !== undefined &&
+            options.initialFetchCursor !== ''
+          ) {
+            emptyCatchupRewound = true;
+            lastFetchedCursor = undefined;
+            pendingPageCursor = undefined;
+            requestGlobalDelta(undefined);
           }
         } else if (msg.nextCursor) {
           await checkpointFetchCursor(msg.nextCursor);
@@ -859,6 +863,8 @@ export function attachPeerSession(
   }
   peer.resumeInbound?.();
 
+  pushProactiveReceptionTail();
+
   send({
     type: 'subscribe',
     delta: {
@@ -872,7 +878,6 @@ export function attachPeerSession(
     },
   });
   requestGlobalDelta(options.initialFetchCursor);
-  scheduleProactiveReceptionTail();
   scheduleOrphanRepair();
 
   const stop = (): void => {
