@@ -118,7 +118,13 @@ async function toWireRef(log: Log, ref: ReceptionObjectRef): Promise<ObjectRef |
   }
   try {
     const event = await log.events.retrieveEvent(pk, ref.hash as Hash);
-    const blockRefs = event.envelope.blockRefs.map((h) => h as string);
+    const blockRefs: string[] = [];
+    for (const h of event.envelope.blockRefs) {
+      const hash = h as Hash;
+      if (await log.blocks.has(hash)) {
+        blockRefs.push(hash as string);
+      }
+    }
     return {
       kind: 'event',
       channel: ref.channel,
@@ -334,10 +340,15 @@ export function attachPeerSession(
       });
   };
 
-  const send = (message: SyncMessage): void => {
-    runOutbound(() => {
+  const send = (message: SyncMessage, urgent = false): void => {
+    const write = (): void => {
       peer.write(encodeFrame(message));
-    });
+    };
+    if (urgent) {
+      write();
+      return;
+    }
+    runOutbound(write);
   };
 
   /**
@@ -349,7 +360,33 @@ export function attachPeerSession(
    * incoming stream for that hash completes (any outcome) or on session stop.
    */
   const inflight = inflightBlockRegistry(log);
+  /** Block hashes the peer asked for that we cannot serve — do not re-want every page. */
+  const unsatisfiableBlockWants = new Set<string>();
   const claimedHashes = new Set<string>();
+
+  const missingRefsForWant = async (refs: readonly ObjectRef[]): Promise<ObjectRef[]> => {
+    const missing: ObjectRef[] = [];
+    for (const ref of refs) {
+      if (ref.kind === 'block') {
+        const key = ref.hash.toLowerCase();
+        if (unsatisfiableBlockWants.has(key)) {
+          continue;
+        }
+      }
+      if (!(await hasObject(log, ref))) {
+        missing.push(ref);
+      }
+    }
+    return missing;
+  };
+
+  const tailReceptionCursor = async (): Promise<string | undefined> => {
+    const maxSeq = await readLocalReceptionMaxSeq(storageRoot);
+    if (maxSeq <= 0) {
+      return undefined;
+    }
+    return String(Math.max(-1, maxSeq - 256));
+  };
   const claimBlockWant = (hash: string): boolean => {
     const key = hash.toLowerCase();
     if (claimedHashes.has(key)) return true;
@@ -368,9 +405,10 @@ export function attachPeerSession(
     refs: readonly ReceptionObjectRef[],
     more = false,
     nextCursor?: string,
+    urgent = false,
   ): Promise<void> => {
     if (refs.length === 0 && !more) {
-      send({ type: 'have', subject, objects: [], more: false });
+      send({ type: 'have', subject, objects: [], more: false }, urgent);
       return;
     }
     const objects: ObjectRef[] = [];
@@ -397,19 +435,22 @@ export function attachPeerSession(
         `have → page had ${refs.length} journal ref(s) but none are locally available`,
       );
       if (more && nextCursor !== undefined) {
-        send({ type: 'have', subject, objects: [], more: true, nextCursor });
+        send({ type: 'have', subject, objects: [], more: true, nextCursor }, urgent);
       }
       return;
     }
     const effectiveNext =
       objects.length === 0 && refs.length > 0 && !more ? undefined : nextCursor;
-    send({
-      type: 'have',
-      subject,
-      objects,
-      more,
-      ...(effectiveNext !== undefined ? { nextCursor: effectiveNext } : {}),
-    });
+    send(
+      {
+        type: 'have',
+        subject,
+        objects,
+        more,
+        ...(effectiveNext !== undefined ? { nextCursor: effectiveNext } : {}),
+      },
+      urgent,
+    );
     syncDebugLine(
       'wire',
       `have → objects=${objects.length} more=${more}` +
@@ -499,7 +540,7 @@ export function attachPeerSession(
       const start = Math.max(-1, maxSeq - window);
       const out = await log.reception.listAfter(String(start), window);
       if (out.refs.length > 0) {
-        await sendHave(out.refs, out.more, out.next);
+        await sendHave(out.refs, out.more, out.next, true);
       }
     })().catch((err) => {
       logSyncError('proactiveReceptionTail', err);
@@ -508,7 +549,7 @@ export function attachPeerSession(
 
   const announcer: LocalHaveAnnouncer = {
     pushLocalHave(refs) {
-      void sendHave(refs, false);
+      void sendHave(refs, false, undefined, true);
     },
   };
   const unregister = registerLocalHaveAnnouncer(announcer);
@@ -536,7 +577,7 @@ export function attachPeerSession(
         `have ← objects=${msg.objects.length} more=${msg.more}` +
           (msg.nextCursor !== undefined ? ` next=${msg.nextCursor}` : ''),
       );
-      const candidates = await missingRefs(log, msg.objects);
+      const candidates = await missingRefsForWant(msg.objects);
       const wants: ObjectRef[] = [];
       for (const ref of candidates) {
         if (ref.kind === 'block') {
@@ -583,8 +624,8 @@ export function attachPeerSession(
           ) {
             lastFetchedCursor = undefined;
             pendingPageCursor = undefined;
-            syncDebugLine('wire', 'have ← empty page — stale fetch cursor, restart delta from start');
-            requestGlobalDelta(undefined);
+            syncDebugLine('wire', 'have ← empty page — stale fetch cursor, catch up from reception tail');
+            requestGlobalDelta(await tailReceptionCursor());
           } else if (
             !emptyCatchupRewound &&
             options.initialFetchCursor !== undefined &&
@@ -593,8 +634,8 @@ export function attachPeerSession(
             emptyCatchupRewound = true;
             lastFetchedCursor = undefined;
             pendingPageCursor = undefined;
-            syncDebugLine('wire', 'have ← empty terminal page — rewind fetch cursor once');
-            requestGlobalDelta(undefined);
+            syncDebugLine('wire', 'have ← empty terminal page — rewind to reception tail');
+            requestGlobalDelta(await tailReceptionCursor());
           }
         } else if (msg.nextCursor) {
           await checkpointFetchCursor(msg.nextCursor);
@@ -615,6 +656,7 @@ export function attachPeerSession(
         }
         if (!(await log.blocks.has(ref.hash as Hash))) {
           blockMissingLocal += 1;
+          unsatisfiableBlockWants.add(ref.hash.toLowerCase());
           continue;
         }
         if (storageRoot) {
@@ -933,7 +975,6 @@ export function attachPeerSession(
         : {}),
     },
   });
-  requestGlobalDelta(options.initialFetchCursor);
   scheduleOrphanRepair();
 
   const stop = (): void => {
