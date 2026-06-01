@@ -43,6 +43,7 @@ export {
   isSyncTimelineEnabled,
   syncTimelineMark,
   syncTimelineKey,
+  type SyncTimelineSink,
 } from '../syncTimeline.js';
 export {
   readDaemonConfig,
