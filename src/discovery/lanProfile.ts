@@ -53,7 +53,12 @@ export function parseLanDiscoveryTxtRecord(
   const peerId = typeof value.peer === 'string' ? value.peer.trim().toLowerCase() : '';
   const instancePublicKey = typeof value.inst === 'string' ? value.inst.trim().toLowerCase() : '';
   const alpn = typeof value.alpn === 'string' ? value.alpn.trim() : '';
-  const syncPortRaw = typeof value.syncPort === 'string' ? value.syncPort.trim() : '';
+  const syncPortRaw =
+    typeof value.syncPort === 'string'
+      ? value.syncPort.trim()
+      : typeof value.port === 'string'
+        ? value.port.trim()
+        : '';
   const profilePublicKey = typeof value.prof === 'string' ? value.prof.trim().toLowerCase() : '';
   const syncPort = Number.parseInt(syncPortRaw, 10);
   if (

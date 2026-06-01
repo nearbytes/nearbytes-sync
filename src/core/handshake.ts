@@ -49,6 +49,13 @@ export interface FriendHandshakeResult {
   readonly remoteProfile: string;
   readonly remotePeerId: string;
   readonly remoteInstancePublicKey: string;
+  /**
+   * Control frames that arrived in the same read window as the remote hello.
+   * TCP may coalesce `hello` with the peer-loop's immediate `subscribe/delta`;
+   * the handshake decoder must not drop those frames before the peer-loop
+   * decoder is attached.
+   */
+  readonly earlyMessages: readonly SyncMessage[];
 }
 
 /**
@@ -66,6 +73,7 @@ export function exchangeFriendHandshake(
   const seenNonces = new Set<string>();
   let remoteResult: FriendHandshakeResult | null = null;
   let localHelloSent = false;
+  const earlyMessages: SyncMessage[] = [];
 
   return new Promise((resolve, reject) => {
     let stopHandshakeData: (() => void) | null = null;
@@ -84,6 +92,7 @@ export function exchangeFriendHandshake(
 
     const tryComplete = (): void => {
       if (localHelloSent && remoteResult !== null) {
+        peer.pauseInbound?.();
         detachHandshake();
         clearTimer();
         resolve(remoteResult);
@@ -107,6 +116,7 @@ export function exchangeFriendHandshake(
 
     const onMessage = (msg: SyncMessage): void => {
       if (msg.type !== 'hello') {
+        earlyMessages.push(msg);
         return;
       }
       if (msg.protocol !== PROTOCOL) {
@@ -192,7 +202,12 @@ export function exchangeFriendHandshake(
         );
         return;
       }
-      remoteResult = { remoteProfile: remote, remotePeerId, remoteInstancePublicKey };
+      remoteResult = {
+        remoteProfile: remote,
+        remotePeerId,
+        remoteInstancePublicKey,
+        earlyMessages,
+      };
       tryComplete();
     };
 

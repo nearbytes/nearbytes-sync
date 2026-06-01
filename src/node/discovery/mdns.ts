@@ -64,6 +64,52 @@ export function createMdnsDiscovery(options: {
     return options.friendProfileKeys.has(key) || localProfileSet.has(key);
   };
 
+  const maybeEmitDiscoveredTcpPeer = (
+    parsed: NonNullable<ReturnType<typeof parseLanDiscoveryTxtRecord>>,
+    host: string,
+    labelPrefix: 'mdns' | 'mcast',
+  ): void => {
+    if (!peerHandler) {
+      return;
+    }
+    if (parsed.alpn !== LAN_TRANSPORT_PROFILE_ID) {
+      return;
+    }
+    if (parsed.instancePublicKey === options.instancePublicKey) {
+      return;
+    }
+    if (!isAuthorizedRemoteProfile(parsed.profilePublicKey)) {
+      return;
+    }
+    const isSibling = localProfileSet.has(parsed.profilePublicKey);
+    const dialAsProfile = isSibling ? parsed.profilePublicKey : activeProfile;
+    if (
+      !shouldInitiateSyncTcp(
+        dialAsProfile,
+        parsed.profilePublicKey,
+        options.instancePublicKey,
+        parsed.instancePublicKey,
+      )
+    ) {
+      return;
+    }
+    const key = `${parsed.profilePublicKey}:${parsed.instancePublicKey}:${host}:${parsed.syncPort}`;
+    if (seenTcp.has(key)) {
+      return;
+    }
+    seenTcp.add(key);
+    peerHandler({
+      transport: 'tcp',
+      label: `${labelPrefix}:${parsed.peerId}->${parsed.profilePublicKey.slice(0, 12)}`,
+      host,
+      port: parsed.syncPort,
+      profilePublicKey: parsed.profilePublicKey,
+      associationProfile: parsed.profilePublicKey,
+      remotePeerId: parsed.peerId,
+      remoteInstancePublicKey: parsed.instancePublicKey,
+    });
+  };
+
   const startListenerForProfile = async (profile: string): Promise<{ server: Server; port: number }> => {
     const server = createServer((socket) => {
       if (!peerHandler) {
@@ -126,49 +172,42 @@ export function createMdnsDiscovery(options: {
           return;
         }
         const parsed = parseLanDiscoveryTxtRecord((service.txt ?? {}) as Record<string, unknown>);
-        if (!parsed || parsed.alpn !== LAN_TRANSPORT_PROFILE_ID) {
-          return;
-        }
-        if (parsed.instancePublicKey === options.instancePublicKey) {
-          return;
-        }
-        if (!isAuthorizedRemoteProfile(parsed.profilePublicKey)) {
-          return;
-        }
-        const isSibling = localProfileSet.has(parsed.profilePublicKey);
-        const dialAsProfile = isSibling ? parsed.profilePublicKey : activeProfile;
-        if (
-          !shouldInitiateSyncTcp(
-            dialAsProfile,
-            parsed.profilePublicKey,
-            options.instancePublicKey,
-            parsed.instancePublicKey,
-          )
-        ) {
+        if (!parsed) {
           return;
         }
         const host = service.addresses.find((a: string) => !a.includes(':')) ?? service.addresses[0];
-        const key = `${parsed.profilePublicKey}:${parsed.instancePublicKey}:${host}:${parsed.syncPort}`;
-        if (seenTcp.has(key)) {
-          return;
-        }
-        seenTcp.add(key);
-        peerHandler({
-          transport: 'tcp',
-          label: `mdns:${parsed.peerId}->${parsed.profilePublicKey.slice(0, 12)}`,
-          host,
-          port: parsed.syncPort,
-          profilePublicKey: parsed.profilePublicKey,
-          associationProfile: parsed.profilePublicKey,
-          remotePeerId: parsed.peerId,
-          remoteInstancePublicKey: parsed.instancePublicKey,
-        });
+        maybeEmitDiscoveredTcpPeer(parsed, host, 'mdns');
       });
 
       multicastSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+      multicastSocket.on('message', (message, rinfo) => {
+        let value: unknown;
+        try {
+          value = JSON.parse(new TextDecoder().decode(message));
+        } catch {
+          return;
+        }
+        if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+          return;
+        }
+        const parsed = parseLanDiscoveryTxtRecord(value as Record<string, unknown>);
+        if (!parsed) {
+          return;
+        }
+        maybeEmitDiscoveredTcpPeer(parsed, rinfo.address, 'mcast');
+      });
       await new Promise<void>((resolve, reject) => {
         multicastSocket!.once('error', reject);
-        multicastSocket!.bind(LAN_MULTICAST_PORT, () => resolve());
+        multicastSocket!.bind(LAN_MULTICAST_PORT, () => {
+          try {
+            multicastSocket!.addMembership(LAN_MULTICAST_GROUP);
+          } catch {
+            // Some platforms report membership already joined when several
+            // local test instances bind the same multicast port. The socket
+            // can still receive unicast/multicast packets on the port.
+          }
+          resolve();
+        });
       });
       multicastSocket.setMulticastTTL(1);
       const payloads = tcpServers.map((entry) => {
@@ -176,12 +215,16 @@ export function createMdnsDiscovery(options: {
           pv: '0.4',
           peer: options.peerId,
           inst: options.instancePublicKey,
-          port: entry.port,
+          syncPort: String(entry.port),
           alpn: LAN_TRANSPORT_PROFILE_ID,
+          caps: 'sync-v1,global-delta',
           prof: entry.profile,
         });
         return new TextEncoder().encode(announcement);
       });
+      for (const payload of payloads) {
+        multicastSocket.send(payload, LAN_MULTICAST_PORT, LAN_MULTICAST_GROUP);
+      }
       multicastTimer = setInterval(() => {
         if (!multicastSocket) return;
         for (const payload of payloads) {

@@ -353,7 +353,12 @@ export async function start(
           return;
         }
 
-        const { remoteProfile, remotePeerId, remoteInstancePublicKey } = await exchangeFriendHandshake(duplex, {
+        const {
+          remoteProfile,
+          remotePeerId,
+          remoteInstancePublicKey,
+          earlyMessages,
+        } = await exchangeFriendHandshake(duplex, {
           localProfilePublicKey: localProfileForAssoc,
           localPeerId: peerId,
           localInstancePublicKey: instancePublicKey,
@@ -388,6 +393,7 @@ export async function start(
           {
             blockStorageRoot: storageRoot,
             initialFetchCursor: await fetchCursors.get(remoteProfile, remoteInstancePublicKey),
+            initialMessages: earlyMessages,
             onFetchCursorCheckpoint: (cursor) =>
               fetchCursors.put(remoteProfile, remoteInstancePublicKey, cursor).catch((err) =>
                 logSyncError('fetchCursorCheckpoint', err),

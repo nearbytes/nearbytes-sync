@@ -84,6 +84,8 @@ export interface AttachPeerSessionOptions {
   readonly initialFetchCursor?: string;
   /** Called after a remote `have` page has been processed and can be checkpointed. */
   readonly onFetchCursorCheckpoint?: (cursor: string) => void | Promise<void>;
+  /** Already-decoded control frames captured during the hello handshake. */
+  readonly initialMessages?: readonly SyncMessage[];
   /**
    * Observability sink for wire-level activity on this session. The
    * caller (typically `FriendSessionRegistry.attach`) bakes the remote
@@ -94,7 +96,17 @@ export interface AttachPeerSessionOptions {
   readonly events?: PeerSessionEventEmitter;
 }
 
-async function toWireRef(log: Log, ref: ReceptionObjectRef): Promise<ObjectRef> {
+function isMissingLocalObjectError(err: unknown): boolean {
+  if (err instanceof Error && 'code' in err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+  if (err instanceof Error) {
+    return err.message.includes('File not found') || err.message.includes('no such file');
+  }
+  return false;
+}
+
+async function toWireRef(log: Log, ref: ReceptionObjectRef): Promise<ObjectRef | null> {
   if (ref.kind === 'block') {
     return { kind: 'block', hash: ref.hash };
   }
@@ -112,6 +124,9 @@ async function toWireRef(log: Log, ref: ReceptionObjectRef): Promise<ObjectRef> 
       ...(blockRefs.length > 0 ? { blockRefs } : {}),
     };
   } catch (err) {
+    if (isMissingLocalObjectError(err)) {
+      return null;
+    }
     logSyncError('toWireRef', err);
     return { kind: 'event', channel: ref.channel, hash: ref.hash };
   }
@@ -169,13 +184,6 @@ async function pumpBlockStream(peer: DuplexPeer, bytes: Uint8Array): Promise<voi
   }
 }
 
-function isMissingLocalBlockError(err: unknown): boolean {
-  if (!(err instanceof Error) || !('code' in err)) {
-    return false;
-  }
-  return (err as NodeJS.ErrnoException).code === 'ENOENT';
-}
-
 function sendBlockStream(
   log: Log,
   runOutbound: (fn: () => void | Promise<void>) => void,
@@ -224,7 +232,7 @@ function sendBlockStream(
         sessionEvents.blockSent(ref.hash, pumped.bytes);
       }
     } catch (err) {
-      if (isMissingLocalBlockError(err)) {
+      if (isMissingLocalObjectError(err)) {
         return;
       }
       logSyncError(`sendBlockStream:${ref.hash.slice(0, 16)}`, err);
@@ -330,7 +338,10 @@ export function attachPeerSession(
     }
     const objects: ObjectRef[] = [];
     for (const ref of refs) {
-      objects.push(await toWireRef(log, ref));
+      const wireRef = await toWireRef(log, ref);
+      if (wireRef !== null) {
+        objects.push(wireRef);
+      }
     }
     send({
       type: 'have',
@@ -733,6 +744,10 @@ export function attachPeerSession(
   });
 
   peer.onData(decodeControl);
+  for (const message of options.initialMessages ?? []) {
+    runInbound(() => onMessage(message));
+  }
+  peer.resumeInbound?.();
 
   send({
     type: 'subscribe',
