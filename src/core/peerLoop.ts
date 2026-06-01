@@ -442,6 +442,31 @@ export function attachPeerSession(
       });
   };
 
+  /**
+   * When a peer attaches, advertise the tail of our reception journal so a
+   * late joiner (or a peer with a stale fetch cursor) still sees recent writes
+   * made while it was offline — mutual `delta` alone is not always enough.
+   */
+  const scheduleProactiveReceptionTail = (): void => {
+    orphanRepairChain = orphanRepairChain
+      .then(async () => {
+        await inboundWire;
+        const maxSeq = await readLocalReceptionMaxSeq(storageRoot);
+        if (maxSeq <= 0) {
+          return;
+        }
+        const window = 256;
+        const start = Math.max(-1, maxSeq - window);
+        const out = await log.reception.listAfter(String(start), window);
+        if (out.refs.length > 0) {
+          await sendHave(out.refs, out.more, out.next);
+        }
+      })
+      .catch((err) => {
+        logSyncError('proactiveReceptionTail', err);
+      });
+  };
+
   const announcer: LocalHaveAnnouncer = {
     pushLocalHave(refs) {
       void sendHave(refs, false);
@@ -847,6 +872,8 @@ export function attachPeerSession(
     },
   });
   requestGlobalDelta(options.initialFetchCursor);
+  scheduleProactiveReceptionTail();
+  scheduleOrphanRepair();
 
   const stop = (): void => {
     unregister();
