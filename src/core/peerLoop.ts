@@ -343,12 +343,24 @@ export function attachPeerSession(
         objects.push(wireRef);
       }
     }
+    if (objects.length === 0 && refs.length > 0) {
+      logSyncError(
+        'sendHave: reception refs could not be encoded (missing on disk?)',
+        new Error(`refs=${refs.length} more=${more}`),
+      );
+      if (more && nextCursor !== undefined) {
+        send({ type: 'have', subject, objects: [], more: true, nextCursor });
+      }
+      return;
+    }
+    const effectiveNext =
+      objects.length === 0 && refs.length > 0 && !more ? undefined : nextCursor;
     send({
       type: 'have',
       subject,
       objects,
       more,
-      ...(nextCursor !== undefined ? { nextCursor } : {}),
+      ...(effectiveNext !== undefined ? { nextCursor: effectiveNext } : {}),
     });
   };
 
@@ -378,18 +390,33 @@ export function attachPeerSession(
    * Chains on the inbound serial queue so repair never races a half-handled frame.
    */
   let orphanRepairChain = Promise.resolve();
+  /** Last durable fetch cursor for this remote instance (SYNC-19). */
+  let lastFetchedCursor = options.initialFetchCursor;
+  /** Page cursor to checkpoint only after outstanding `want`/`data` work finishes. */
+  let pendingPageCursor: string | undefined;
+
+  const flushPendingPageCursor = async (): Promise<void> => {
+    if (pendingPageCursor === undefined) {
+      return;
+    }
+    const cursor = pendingPageCursor;
+    pendingPageCursor = undefined;
+    await checkpointFetchCursor(cursor);
+    lastFetchedCursor = cursor;
+  };
+
   const scheduleOrphanRepair = (): void => {
     orphanRepairChain = orphanRepairChain
       .then(async () => {
         await inboundWire;
         const repair = await repairMissingEventDependencyWants(log);
-        if (repair.length === 0) {
-          return;
+        if (repair.length > 0) {
+          const wants = await missingRefs(log, repair);
+          if (wants.length > 0) {
+            sendWants(wants);
+          }
         }
-        const wants = await missingRefs(log, repair);
-        if (wants.length > 0) {
-          sendWants(wants);
-        }
+        await flushPendingPageCursor();
       })
       .catch((err) => {
         logSyncError('orphanRepair', err);
@@ -434,13 +461,36 @@ export function attachPeerSession(
       }
       if (wants.length > 0) {
         sendWants(wants);
+        if (msg.nextCursor !== undefined) {
+          pendingPageCursor = msg.nextCursor;
+        }
+        if (msg.more && msg.nextCursor) {
+          orphanRepairChain = orphanRepairChain
+            .then(async () => {
+              await inboundWire;
+              await flushPendingPageCursor();
+              requestGlobalDelta(msg.nextCursor);
+            })
+            .catch((err) => {
+              logSyncError('havePageContinue', err);
+            });
+        } else {
+          scheduleOrphanRepair();
+        }
+        return;
       }
       if (msg.more && msg.nextCursor) {
         await checkpointFetchCursor(msg.nextCursor);
+        lastFetchedCursor = msg.nextCursor;
         requestGlobalDelta(msg.nextCursor);
       } else {
         if (msg.nextCursor) {
-          await checkpointFetchCursor(msg.nextCursor);
+          if (msg.objects.length === 0) {
+            requestGlobalDelta(lastFetchedCursor);
+          } else {
+            await checkpointFetchCursor(msg.nextCursor);
+            lastFetchedCursor = msg.nextCursor;
+          }
         }
         scheduleOrphanRepair();
       }
