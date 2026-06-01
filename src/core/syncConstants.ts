@@ -1,21 +1,16 @@
 /**
- * Reception journal paging. Small journals fit one page; large journals paginate.
+ * Reception journal paging.
  */
 export const RECEPTION_PAGE_LIMIT = Number(
-  process.env.NEARBYTES_SYNC_RECEPTION_PAGE ?? 4_096,
+  process.env.NEARBYTES_SYNC_RECEPTION_PAGE ?? 256,
 );
 
-/** Tail length on attach when the journal exceeds {@link RECEPTION_PAGE_LIMIT}. */
+/** Max objects per resume / urgent delta response (one have frame). */
+export const RECEPTION_RESUME_PAGE = Number(
+  process.env.NEARBYTES_SYNC_RESUME_PAGE ?? 64,
+);
+
+/** Tail length announced on attach. */
 export const RECEPTION_ATTACH_TAIL = Number(
   process.env.NEARBYTES_SYNC_RECEPTION_TAIL ?? 256,
 );
-
-/** Urgent attach / empty-have dependency scan depth (not full orphan repair). */
-export const RECEPTION_DEPENDENCY_SCAN_TAIL = Number(
-  process.env.NEARBYTES_SYNC_DEPENDENCY_TAIL ?? 32,
-);
-
-/** At or below this remote/local max `seq`, anti-entropy uses one full `have` page. */
-export function useInstantReceptionSync(maxSeq: number): boolean {
-  return maxSeq > 0 && maxSeq <= RECEPTION_PAGE_LIMIT;
-}

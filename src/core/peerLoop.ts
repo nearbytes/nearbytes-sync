@@ -16,7 +16,7 @@ import {
   listLocalReceptionPage,
 } from './receptionSync.js';
 import { buildResumeDelta, buildResumeSubscribe } from './sessionAttach.js';
-import { RECEPTION_DEPENDENCY_SCAN_TAIL } from './syncConstants.js';
+import { RECEPTION_RESUME_PAGE } from './syncConstants.js';
 import {
   BLOCK_STREAM_WRITE_SLICE_BYTES,
   createWireDecoder,
@@ -559,9 +559,6 @@ export function attachPeerSession(
   let pendingPageCursor: string | undefined;
   /** One-shot rewind when a persisted cursor yields empty pages but we may still be behind. */
   let emptyCatchupRewound = false;
-  /** One-shot urgent re-delta at the current cursor (remote may have been mid-write). */
-  let emptyTailRetried = false;
-  let dependencyWantChain: Promise<number> = Promise.resolve(0);
 
   const flushPendingPageCursor = async (): Promise<void> => {
     if (pendingPageCursor === undefined) {
@@ -577,30 +574,18 @@ export function attachPeerSession(
     orphanRepairChain = orphanRepairChain
       .then(async () => {
         await inboundWire;
-        await pullAndSendDependencyWants(false);
+        const repair = await repairMissingEventDependencyWants(log, storageRoot);
+        if (repair.length > 0) {
+          const wants = await missingRefs(log, repair, storageRoot);
+          if (wants.length > 0) {
+            sendWants(wants);
+          }
+        }
         await flushPendingPageCursor();
       })
       .catch((err) => {
         logSyncError('orphanRepair', err);
       });
-  };
-
-  /** Scan local event chains for missing blocks/parents; return wants actually sent. */
-  const pullAndSendDependencyWants = (urgent = false): Promise<number> => {
-    dependencyWantChain = dependencyWantChain.then(async () => {
-      const repair = await repairMissingEventDependencyWants(log, storageRoot, {
-        ...(urgent ? { maxEventsPerChannel: RECEPTION_DEPENDENCY_SCAN_TAIL } : {}),
-      });
-      if (repair.length === 0) {
-        return 0;
-      }
-      const wants = await missingRefs(log, repair, storageRoot);
-      if (wants.length > 0) {
-        sendWants(wants);
-      }
-      return wants.length;
-    });
-    return dependencyWantChain;
   };
 
   let timelineHaveInLogged = false;
@@ -645,13 +630,23 @@ export function attachPeerSession(
     }
 
     if (msg.type === 'delta' && msg.mode === 'global') {
-      const out = await listLocalReceptionPage(log, storageRoot, msg.cursor);
+      const out = await listLocalReceptionPage(
+        log,
+        storageRoot,
+        msg.cursor,
+        msg.limit ?? RECEPTION_RESUME_PAGE,
+      );
       await sendHave(out.refs, out.more, out.next, true);
       return;
     }
 
     if (msg.type === 'subscribe' && msg.delta.mode === 'global') {
-      const out = await listLocalReceptionPage(log, storageRoot, msg.delta.cursor);
+      const out = await listLocalReceptionPage(
+        log,
+        storageRoot,
+        msg.delta.cursor,
+        msg.delta.limit ?? RECEPTION_RESUME_PAGE,
+      );
       await sendHave(out.refs, out.more, out.next, true);
       return;
     }
@@ -688,46 +683,21 @@ export function attachPeerSession(
           pendingPageCursor = msg.nextCursor;
         }
         if (msg.more && msg.nextCursor) {
-          orphanRepairChain = orphanRepairChain
-            .then(async () => {
-              await inboundWire;
-              await flushPendingPageCursor();
-              requestGlobalDelta(msg.nextCursor, true);
-            })
-            .catch((err) => {
-              logSyncError('havePageContinue', err);
-            });
+          requestGlobalDelta(msg.nextCursor, true);
         } else {
-          scheduleOrphanRepair();
+          await flushPendingPageCursor();
         }
         return;
       }
       if (msg.more && msg.nextCursor) {
         requestGlobalDelta(msg.nextCursor, true);
       } else if (msg.objects.length === 0 && !msg.more) {
-        const dependencyWants = await pullAndSendDependencyWants(true);
         if (
-          !emptyTailRetried &&
-          lastFetchedCursor !== undefined &&
-          lastFetchedCursor !== ''
-        ) {
-          emptyTailRetried = true;
-          syncDebugLine('wire', 'have ← empty at cursor — retry tail delta');
-          requestGlobalDelta(lastFetchedCursor, true);
-          if (dependencyWants === 0) {
-            scheduleOrphanRepair();
-          }
-          return;
-        }
-        if (
-          dependencyWants === 0 &&
           !emptyCatchupRewound &&
           lastFetchedCursor !== undefined &&
           lastFetchedCursor !== ''
         ) {
           emptyCatchupRewound = true;
-          lastFetchedCursor = undefined;
-          pendingPageCursor = undefined;
           syncDebugLine('wire', 'have ← empty at cursor — restart from start');
           requestGlobalDelta(undefined, true);
         } else if (msg.nextCursor !== undefined) {
@@ -736,15 +706,11 @@ export function attachPeerSession(
         } else if (lastFetchedCursor !== undefined && lastFetchedCursor !== '') {
           await checkpointFetchCursor(lastFetchedCursor);
         }
-        if (dependencyWants === 0) {
-          scheduleOrphanRepair();
-        }
       } else {
         if (msg.nextCursor !== undefined) {
           await checkpointFetchCursor(msg.nextCursor);
           lastFetchedCursor = msg.nextCursor;
         }
-        scheduleOrphanRepair();
       }
       return;
     }

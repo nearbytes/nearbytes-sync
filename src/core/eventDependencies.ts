@@ -5,11 +5,6 @@ import { publicKeyFromHex, publicKeyToHex } from 'nearbytes-log';
 import { blockReadable } from './blockReadable.js';
 import type { ObjectRef } from './types.js';
 
-export interface RepairDependencyWantsOptions {
-  /** When set, only scan the last N events per channel (attach / urgent paths). */
-  readonly maxEventsPerChannel?: number;
-}
-
 const REPAIR_BATCH = 16;
 
 /**
@@ -83,7 +78,6 @@ export async function missingDepsFromBlockRefs(
 export async function repairMissingEventDependencyWants(
   log: Log,
   storageRoot?: string,
-  options: RepairDependencyWantsOptions = {},
 ): Promise<ObjectRef[]> {
   const channels = await log.events.listChannels();
   const wants: ObjectRef[] = [];
@@ -91,12 +85,8 @@ export async function repairMissingEventDependencyWants(
     const channelHex = publicKeyToHex(pk).toLowerCase();
     const hashes = await log.events.listEvents(pk);
     const knownEvents = new Set(hashes.map((h) => h.toLowerCase()));
-    const scan =
-      options.maxEventsPerChannel !== undefined && options.maxEventsPerChannel > 0
-        ? hashes.slice(-options.maxEventsPerChannel)
-        : hashes;
-    for (let i = 0; i < scan.length; i += REPAIR_BATCH) {
-      const batch = scan.slice(i, i + REPAIR_BATCH);
+    for (let i = 0; i < hashes.length; i += REPAIR_BATCH) {
+      const batch = hashes.slice(i, i + REPAIR_BATCH);
       const batchWants = await Promise.all(
         batch.map(async (eventHash) => {
           try {

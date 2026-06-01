@@ -1,5 +1,5 @@
 import type { Subject, SyncMessage } from './types.js';
-import { RECEPTION_PAGE_LIMIT } from './syncConstants.js';
+import { RECEPTION_RESUME_PAGE } from './syncConstants.js';
 
 /** Resume this remote instance's reception journal from our persisted cursor. */
 export function buildResumeDelta(
@@ -10,7 +10,7 @@ export function buildResumeDelta(
     type: 'delta',
     subject,
     mode: 'global',
-    limit: RECEPTION_PAGE_LIMIT,
+    limit: RECEPTION_RESUME_PAGE,
     ...(cursor !== undefined && cursor !== '' ? { cursor } : {}),
   };
 }

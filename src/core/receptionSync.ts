@@ -5,7 +5,7 @@ import type { ReceptionListResult } from 'nearbytes-log';
 import {
   RECEPTION_ATTACH_TAIL,
   RECEPTION_PAGE_LIMIT,
-  useInstantReceptionSync,
+  RECEPTION_RESUME_PAGE,
 } from './syncConstants.js';
 
 export async function readLocalReceptionMaxSeq(storageRoot: string | undefined): Promise<number> {
@@ -30,35 +30,26 @@ export async function listLocalReceptionPage(
   log: Log,
   storageRoot: string | undefined,
   cursor?: string,
+  limit = RECEPTION_PAGE_LIMIT,
 ): Promise<ReceptionListResult> {
   const maxSeq = await readLocalReceptionMaxSeq(storageRoot);
-  let parsedCursor = -1;
   if (cursor !== undefined && cursor !== '') {
-    parsedCursor = Number.parseInt(cursor, 10);
-    if (!Number.isNaN(parsedCursor) && parsedCursor >= maxSeq) {
+    const parsed = Number.parseInt(cursor, 10);
+    if (!Number.isNaN(parsed) && parsed >= maxSeq) {
       return { refs: [], more: false, next: String(maxSeq) };
     }
   }
-  if (useInstantReceptionSync(maxSeq)) {
-    const start = cursor === undefined || cursor === '' ? '-1' : cursor;
-    const limit =
-      start === '-1'
-        ? Math.min(RECEPTION_PAGE_LIMIT, maxSeq + 1)
-        : Math.min(RECEPTION_PAGE_LIMIT, maxSeq - parsedCursor + 1);
-    return log.reception.listAfter(start, limit);
-  }
-  return log.reception.listAfter(cursor, RECEPTION_PAGE_LIMIT);
+  return log.reception.listAfter(cursor, limit);
 }
 
-/** On connect: advertise everything we have (full journal or spec tail). */
+/** On connect: announce recent tail of our journal only. */
 export async function listLocalReceptionForConnect(
   log: Log,
   storageRoot: string | undefined,
 ): Promise<ReceptionListResult> {
   const maxSeq = await readLocalReceptionMaxSeq(storageRoot);
-  if (useInstantReceptionSync(maxSeq)) {
-    return log.reception.listAfter('-1', maxSeq + 1);
-  }
   const start = Math.max(-1, maxSeq - RECEPTION_ATTACH_TAIL);
   return log.reception.listAfter(String(start), RECEPTION_ATTACH_TAIL);
 }
+
+export { RECEPTION_RESUME_PAGE };
