@@ -49,8 +49,8 @@
     "bonjour-service": "^1.2.1",
     "chokidar": "^4.0.3",
     "hyperswarm": "^4.8.2",
-    "nearbytes-crypto": "github:nearbytes/nearbytes-crypto#b63d261fb470e135b20a7c2f5f85691ffa52d695",
-    "nearbytes-log": "github:nearbytes/nearbytes-log#a7f7810c736ce6a6343467da61a3d8e8a049f8e0"
+    "nearbytes-crypto": "github:nearbytes/nearbytes-crypto#6859719510764702844882b8488b35ab31f20145",
+    "nearbytes-log": "github:nearbytes/nearbytes-log#96d579f37b8c9d74d19a62f8019dd415e82b079e"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
