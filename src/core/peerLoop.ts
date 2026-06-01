@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { Hash } from 'nearbytes-crypto';
@@ -159,6 +160,23 @@ async function hasObject(log: Log, ref: ObjectRef): Promise<boolean> {
   }
   const events = await log.events.listEvents(pk);
   return events.includes(ref.hash as Hash);
+}
+
+async function readLocalReceptionMaxSeq(storageRoot: string | undefined): Promise<number> {
+  if (storageRoot === undefined) {
+    return 0;
+  }
+  try {
+    const raw = await readFile(join(storageRoot, 'sync', 'reception.jsonl'), 'utf8');
+    const lines = raw.trim().split('\n').filter((line) => line.length > 0);
+    if (lines.length === 0) {
+      return 0;
+    }
+    const parsed = JSON.parse(lines[lines.length - 1]!) as { seq?: unknown };
+    return typeof parsed.seq === 'number' ? parsed.seq : Number.parseInt(String(parsed.seq), 10) || 0;
+  } catch {
+    return 0;
+  }
 }
 
 async function missingRefs(log: Log, refs: readonly ObjectRef[]): Promise<ObjectRef[]> {
@@ -334,6 +352,7 @@ export function attachPeerSession(
     nextCursor?: string,
   ): Promise<void> => {
     if (refs.length === 0 && !more) {
+      send({ type: 'have', subject, objects: [], more: false });
       return;
     }
     const objects: ObjectRef[] = [];
@@ -484,13 +503,29 @@ export function attachPeerSession(
         lastFetchedCursor = msg.nextCursor;
         requestGlobalDelta(msg.nextCursor);
       } else {
-        if (msg.nextCursor) {
-          if (msg.objects.length === 0) {
-            requestGlobalDelta(lastFetchedCursor);
-          } else {
+        if (msg.objects.length === 0) {
+          const storedCursor =
+            options.initialFetchCursor !== undefined
+              ? Number.parseInt(options.initialFetchCursor, 10)
+              : undefined;
+          const localMaxSeq = await readLocalReceptionMaxSeq(storageRoot);
+          if (
+            storedCursor !== undefined &&
+            Number.isFinite(storedCursor) &&
+            storedCursor > localMaxSeq
+          ) {
+            lastFetchedCursor = undefined;
+            pendingPageCursor = undefined;
+            requestGlobalDelta(undefined);
+          } else if (msg.nextCursor !== undefined) {
             await checkpointFetchCursor(msg.nextCursor);
             lastFetchedCursor = msg.nextCursor;
+          } else if (lastFetchedCursor !== undefined) {
+            requestGlobalDelta(lastFetchedCursor);
           }
+        } else if (msg.nextCursor) {
+          await checkpointFetchCursor(msg.nextCursor);
+          lastFetchedCursor = msg.nextCursor;
         }
         scheduleOrphanRepair();
       }
