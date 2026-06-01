@@ -1,13 +1,16 @@
 /**
- * Clean per-peer sync connect timeline. Enable via `configureSyncTimeline`
+ * Sync connect timeline. Enable via `configureSyncTimeline`
  * (typically from `nbf --debug timeline` through `installSyncDebugBridge`).
  *
- * One line per phase, ms since first event for that peer (discovery or connect).
- * Wire have/want spam stays on `--debug sync` only.
+ * Session key `session`: ms since REPL/sync boot (discovery startup, peer search).
+ * Per-peer keys: ms since first `discovered` for that peer (connect, hello, data).
  */
 import { formatSyncTimestamp } from './syncDebugLog.js';
 
 export type SyncTimelineSink = (line: string) => void;
+
+/** Global boot clock — REPL start through first peer sighting. */
+export const SYNC_TIMELINE_SESSION = 'session';
 
 let enabled = false;
 let sink: SyncTimelineSink | undefined;
@@ -25,6 +28,30 @@ export function configureSyncTimeline(options: {
 
 export function isSyncTimelineEnabled(): boolean {
   return enabled;
+}
+
+/** Start the session clock; first line is `phase` at +0ms. Safe to call once per process. */
+export function syncTimelineBeginSession(phase = 'boot'): void {
+  if (!enabled) {
+    return;
+  }
+  const now = Date.now();
+  if (!origins.has(SYNC_TIMELINE_SESSION)) {
+    origins.set(SYNC_TIMELINE_SESSION, now);
+  }
+  emitMark(SYNC_TIMELINE_SESSION, now, phase);
+}
+
+export function syncTimelineMarkSession(phase: string, detail = ''): void {
+  syncTimelineMark(SYNC_TIMELINE_SESSION, phase, detail);
+}
+
+export function syncTimelineSessionMs(): number | undefined {
+  const t0 = origins.get(SYNC_TIMELINE_SESSION);
+  if (t0 === undefined) {
+    return undefined;
+  }
+  return Date.now() - t0;
 }
 
 export function syncTimelineKey(profile: string, instance: string): string {
@@ -58,6 +85,20 @@ export function syncTimelineMark(key: string, phase: string, detail = ''): void 
     t0 = now;
     origins.set(key, t0);
   }
+  emitMark(key, now, phase, detail, t0);
+}
+
+export function syncTimelineClear(key: string): void {
+  origins.delete(key);
+}
+
+function emitMark(
+  key: string,
+  now: number,
+  phase: string,
+  detail = '',
+  t0 = origins.get(key) ?? now,
+): void {
   const delta = now - t0;
   const ms = String(delta).padStart(6, ' ');
   const tail = detail.length > 0 ? ` ${detail}` : '';
@@ -67,8 +108,4 @@ export function syncTimelineMark(key: string, phase: string, detail = ''): void 
     return;
   }
   console.error(`[${formatSyncTimestamp(now)}] [nearbytes-sync:timeline] ${body}`);
-}
-
-export function syncTimelineClear(key: string): void {
-  origins.delete(key);
 }

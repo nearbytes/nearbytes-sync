@@ -41,8 +41,11 @@ export {
 export {
   configureSyncTimeline,
   isSyncTimelineEnabled,
+  syncTimelineBeginSession,
+  syncTimelineMarkSession,
   syncTimelineMark,
   syncTimelineKey,
+  SYNC_TIMELINE_SESSION,
   type SyncTimelineSink,
 } from '../syncTimeline.js';
 export {

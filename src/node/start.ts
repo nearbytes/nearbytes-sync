@@ -9,10 +9,12 @@ import { appendBenchMarker } from '../benchMarker.js';
 import { syncDebugLine } from '../syncDebugLog.js';
 import {
   isSyncTimelineEnabled,
+  syncTimelineBeginSession,
   syncTimelineClear,
   syncTimelineHandoff,
   syncTimelineKey,
   syncTimelineMark,
+  syncTimelineMarkSession,
 } from '../syncTimeline.js';
 import { patchLogForReactiveHave } from '../core/sessionRegistry.js';
 import {
@@ -202,6 +204,10 @@ export async function start(
 ): Promise<SyncHandle> {
   patchLogForReactiveHave(log);
 
+  if (isSyncTimelineEnabled()) {
+    syncTimelineMarkSession('sync-enter');
+  }
+
   const friendSet = normalizeKeySet(friends);
   const servedSet = normalizeKeySet(options.serveProfilePublicKeys ?? []);
   if (servedSet.size === 0) {
@@ -236,6 +242,10 @@ export async function start(
   }
   for (const f of friendSet) {
     await addTopicForProfile(f);
+  }
+
+  if (isSyncTimelineEnabled()) {
+    syncTimelineMarkSession('topics-ready', `count=${topics.length}`);
   }
 
   // Discovery starts whenever we have at least one topic to advertise on,
@@ -389,6 +399,7 @@ export async function start(
   const friendSessions = new FriendSessionRegistry(eventBus);
   const connectingPairs = new Set<string>();
   const handshakingDuplexes = new WeakSet<DuplexPeer>();
+  let sessionFirstPeerSeen = false;
 
   const FRIEND_CONNECT_MAX_ATTEMPTS = 3;
   const FRIEND_CONNECT_RETRY_MS = 2_000;
@@ -604,6 +615,13 @@ export async function start(
   };
 
   discovery.onPeer((discovered) => {
+    if (!sessionFirstPeerSeen) {
+      sessionFirstPeerSeen = true;
+      syncTimelineMarkSession(
+        'first-peer',
+        `transport=${discovered.transport} ${discovered.label.slice(0, 56)}`,
+      );
+    }
     syncTimelineMark(
       discovered.label,
       'discovered',
@@ -624,7 +642,17 @@ export async function start(
   });
 
   try {
-    await discovery.start();
+    syncTimelineMarkSession('discovery-starting', `mode=${transport}`);
+    if (transport === 'all') {
+      const dhtStart = Date.now();
+      await backends[0]!.start();
+      syncTimelineMarkSession('dht-ready', `${Date.now() - dhtStart}ms`);
+    }
+    const mdnsIdx = transport === 'all' ? 1 : 0;
+    const mdnsStart = Date.now();
+    await backends[mdnsIdx]!.start();
+    syncTimelineMarkSession('mdns-ready', `${Date.now() - mdnsStart}ms`);
+    syncTimelineMarkSession('peer-search', 'waiting for remote');
   } catch (err) {
     releaseDataDirLock();
     throw err;
