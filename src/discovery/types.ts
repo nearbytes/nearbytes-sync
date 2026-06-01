@@ -15,6 +15,12 @@ export type DiscoveredPeer =
       readonly transport: 'duplex';
       readonly label: string;
       readonly connect: () => Promise<DuplexPeer>;
+      /**
+       * True when this process initiated the Hyperswarm connection (outbound
+       * dial). False for inbound accepts. Used to keep the inbound leg when
+       * NAT would cause our outbound handshake to the same peer to fail.
+       */
+      readonly locallyInitiated?: boolean;
       /** Set when discovery already knows the remote profile key (e.g. mDNS TXT). */
       readonly profilePublicKey?: string;
       /** Profile owning the topic this connection is on (lower-case hex). */

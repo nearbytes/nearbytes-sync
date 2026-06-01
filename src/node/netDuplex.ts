@@ -95,11 +95,18 @@ export function duplexFromTcpSocket(socket: Socket): TcpDuplexPeer {
       handler(buf);
     }
   });
-  socket.on('close', () => {
+  let closed = false;
+  const emitClose = (): void => {
+    if (closed) {
+      return;
+    }
+    closed = true;
     for (const handler of closeHandlers) {
       handler();
     }
-  });
+  };
+  socket.on('close', emitClose);
+  socket.on('error', emitClose);
   return {
     tcpSocket: socket,
     write: (chunk) => {

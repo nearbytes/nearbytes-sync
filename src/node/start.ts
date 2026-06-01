@@ -14,7 +14,8 @@ import {
   logFriendConnectRetry,
   classifyFriendConnectError,
 } from '../logSyncError.js';
-import { exchangeFriendHandshake } from '../core/handshake.js';
+import { exchangeFriendHandshake, SyncHandshakeError } from '../core/handshake.js';
+import type { DuplexPeer } from '../core/peerLoop.js';
 import { FriendSessionRegistry } from '../core/friendSessions.js';
 import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
 import { inflightBlockRegistry, outboundBlockStreamCounter } from '../core/inflightBlocks.js';
@@ -326,9 +327,32 @@ export async function start(
 
   const friendSessions = new FriendSessionRegistry(eventBus);
   const connectingPairs = new Set<string>();
+  const handshakingDuplexes = new WeakSet<DuplexPeer>();
 
   const FRIEND_CONNECT_MAX_ATTEMPTS = 3;
   const FRIEND_CONNECT_RETRY_MS = 2_000;
+  const PAIR_SLOT_WAIT_MS = 60_000;
+  const DHT_HANDSHAKE_TIMEOUT_MS = 30_000;
+
+  const acquirePairSlot = async (pairKey: string): Promise<void> => {
+    const deadline = Date.now() + PAIR_SLOT_WAIT_MS;
+    while (connectingPairs.has(pairKey)) {
+      if (Date.now() >= deadline) {
+        throw new SyncHandshakeError('timeout', 'sync pair slot busy', true);
+      }
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 25);
+        if (typeof t.unref === 'function') {
+          t.unref();
+        }
+      });
+    }
+    connectingPairs.add(pairKey);
+  };
+
+  const releasePairSlot = (pairKey: string): void => {
+    connectingPairs.delete(pairKey);
+  };
 
   const openFriendAssociation = (
     discovered: DiscoveredPeer,
@@ -343,8 +367,13 @@ export async function start(
     const connectScope = `friend-connect:${discovered.label}`;
     void (async () => {
       for (let attempt = 1; attempt <= FRIEND_CONNECT_MAX_ATTEMPTS; attempt++) {
+      let duplex: DuplexPeer | undefined;
       try {
-        const duplex = await connectDiscoveredPeer(discovered);
+        duplex = await connectDiscoveredPeer(discovered);
+        if (handshakingDuplexes.has(duplex)) {
+          return;
+        }
+        handshakingDuplexes.add(duplex);
         if (
           remoteProfileHint !== undefined &&
           !authorizedRemoteProfiles.has(remoteProfileHint)
@@ -364,6 +393,8 @@ export async function start(
           localInstancePublicKey: instancePublicKey,
           subject: profileSubject(associationProfile),
           allowedRemoteProfiles: authorizedRemoteProfiles,
+          timeoutMs:
+            discovered.transport === 'duplex' ? DHT_HANDSHAKE_TIMEOUT_MS : undefined,
         });
         remoteProfileHint = remoteProfile;
 
@@ -371,72 +402,70 @@ export async function start(
         // (same profile, different dataDir instance) each get their own
         // connecting-pair slot and can run in parallel.
         const pairKey = `${localProfileForAssoc}:${remoteProfile}:${remoteInstancePublicKey}`;
-        if (connectingPairs.has(pairKey)) {
-          duplex.close();
-          return;
-        }
-        connectingPairs.add(pairKey);
+        await acquirePairSlot(pairKey);
         pairKeyOptimistic = pairKey;
-
-        await appendBenchMarker(log, 'peer-connected', {
-          transport: discovered.transport,
-          label: discovered.label.slice(0, 64),
-        });
-
-        const storageRoot = options.blockStorageRoot;
-        const { created } = friendSessions.attach(
-          log,
-          remoteProfile,
-          remotePeerId,
-          remoteInstancePublicKey,
-          duplex,
-          {
-            blockStorageRoot: storageRoot,
-            initialFetchCursor: await fetchCursors.get(remoteProfile, remoteInstancePublicKey),
-            initialMessages: earlyMessages,
-            onFetchCursorCheckpoint: (cursor) =>
-              fetchCursors.put(remoteProfile, remoteInstancePublicKey, cursor).catch((err) =>
-                logSyncError('fetchCursorCheckpoint', err),
-              ),
-            ...(storageRoot
-              ? { diskBlockStream: createNodeDiskBlockStreamFactory(storageRoot) }
-              : {}),
-          },
-          discovered.label,
-          localProfileForAssoc,
-        );
-        if (created) {
-          await appendBenchMarker(log, 'friend-session-attached', {
-            remote: remoteProfile.slice(0, 16),
-            remotePeerId: remotePeerId.slice(0, 16),
-            remoteInstance: remoteInstancePublicKey.slice(0, 16),
-            localProfile: localProfileForAssoc.slice(0, 16),
-            sibling: remoteProfile === localProfileForAssoc,
+        try {
+          await appendBenchMarker(log, 'peer-connected', {
+            transport: discovered.transport,
+            label: discovered.label.slice(0, 64),
           });
-          // The friend-session-attached marker above is journal-grade
-          // and survives restarts; the bus emit below is live-grade
-          // and feeds the in-process monitor (`SyncHandle.onEvent`)
-          // and the daemon beacon. Both fire here because they answer
-          // the same question — "we now have a live peer" — at
-          // different latencies and durabilities. peer-disconnected
-          // is emitted by `FriendSessionRegistry` itself when the
-          // close hook fires; no symmetric call here.
-          eventBus.emit({
-            kind: 'peer-connected',
-            at: Date.now(),
-            remoteProfilePublicKey: remoteProfile,
-            remoteInstancePublicKey,
+
+          const storageRoot = options.blockStorageRoot;
+          const { created } = friendSessions.attach(
+            log,
+            remoteProfile,
             remotePeerId,
-            transportLabel: discovered.label,
-            role:
-              remoteProfile === localProfileForAssoc
-                ? ('sibling' as const)
-                : ('friend' as const),
-          });
+            remoteInstancePublicKey,
+            duplex,
+            {
+              blockStorageRoot: storageRoot,
+              initialFetchCursor: await fetchCursors.get(remoteProfile, remoteInstancePublicKey),
+              initialMessages: earlyMessages,
+              onFetchCursorCheckpoint: (cursor) =>
+                fetchCursors.put(remoteProfile, remoteInstancePublicKey, cursor).catch((err) =>
+                  logSyncError('fetchCursorCheckpoint', err),
+                ),
+              ...(storageRoot
+                ? { diskBlockStream: createNodeDiskBlockStreamFactory(storageRoot) }
+                : {}),
+            },
+            discovered.label,
+            localProfileForAssoc,
+            discovered.transport === 'duplex' && discovered.locallyInitiated === true,
+          );
+          if (created) {
+            await appendBenchMarker(log, 'friend-session-attached', {
+              remote: remoteProfile.slice(0, 16),
+              remotePeerId: remotePeerId.slice(0, 16),
+              remoteInstance: remoteInstancePublicKey.slice(0, 16),
+              localProfile: localProfileForAssoc.slice(0, 16),
+              sibling: remoteProfile === localProfileForAssoc,
+            });
+            // The friend-session-attached marker above is journal-grade
+            // and survives restarts; the bus emit below is live-grade
+            // and feeds the in-process monitor (`SyncHandle.onEvent`)
+            // and the daemon beacon. Both fire here because they answer
+            // the same question — "we now have a live peer" — at
+            // different latencies and durabilities. peer-disconnected
+            // is emitted by `FriendSessionRegistry` itself when the
+            // close hook fires; no symmetric call here.
+            eventBus.emit({
+              kind: 'peer-connected',
+              at: Date.now(),
+              remoteProfilePublicKey: remoteProfile,
+              remoteInstancePublicKey,
+              remotePeerId,
+              transportLabel: discovered.label,
+              role:
+                remoteProfile === localProfileForAssoc
+                  ? ('sibling' as const)
+                  : ('friend' as const),
+            });
+          }
+        } finally {
+          releasePairSlot(pairKey);
+          pairKeyOptimistic = null;
         }
-
-        connectingPairs.delete(pairKey);
-        pairKeyOptimistic = null;
         return;
       } catch (err) {
         const classified = classifyFriendConnectError(err);
@@ -470,9 +499,14 @@ export async function start(
           remotePeerId: '',
         });
         if (pairKeyOptimistic !== null) {
-          connectingPairs.delete(pairKeyOptimistic);
+          releasePairSlot(pairKeyOptimistic);
+          pairKeyOptimistic = null;
         }
         return;
+      } finally {
+        if (duplex !== undefined) {
+          handshakingDuplexes.delete(duplex);
+        }
       }
       }
     })();

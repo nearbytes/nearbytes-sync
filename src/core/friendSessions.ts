@@ -15,9 +15,25 @@ export interface FriendSessionEntry {
    * this equals `remoteProfilePublicKey`; for asymmetric follow it differs.
    */
   readonly localAssociationProfile: string;
+  /** Hyperswarm outbound dial vs inbound accept (LAN TCP is always false). */
+  readonly locallyInitiated: boolean;
   readonly stop: () => void;
   close(): void;
   isAlive(): boolean;
+}
+
+/**
+ * On equal transport tier, keep the inbound accept and drop our own outbound
+ * dial so we do not tear down a working NAT-punched leg (WAN siblings).
+ */
+function preferKeepExistingSession(
+  existingLocallyInitiated: boolean,
+  newLocallyInitiated: boolean,
+): boolean {
+  if (existingLocallyInitiated !== newLocallyInitiated) {
+    return !existingLocallyInitiated;
+  }
+  return true;
 }
 
 /** Prefer LAN mDNS TCP over Hyperswarm for bulk throughput. */
@@ -67,6 +83,11 @@ export class FriendSessionRegistry {
       if (entry.isAlive()) n++;
     }
     return n;
+  }
+
+  hasAliveSession(remoteProfile: string, remoteInstancePublicKey: string): boolean {
+    const entry = this.sessions.get(this.sessionKey(remoteProfile, remoteInstancePublicKey));
+    return entry !== undefined && entry.isAlive();
   }
 
   private sessionKey(remoteProfile: string, remoteInstancePublicKey: string): string {
@@ -133,24 +154,34 @@ export class FriendSessionRegistry {
     sessionOptions: AttachPeerSessionOptions = {},
     transportLabel = 'unknown',
     localAssociationProfile = '',
+    locallyInitiated = false,
   ): { readonly entry: FriendSessionEntry; readonly created: boolean } {
     const remote = remoteProfilePublicKey.toLowerCase();
     const remotePid = remotePeerId.toLowerCase();
     const remoteInstance = remoteInstancePublicKey.toLowerCase();
     const key = this.sessionKey(remote, remoteInstance);
     const existing = this.sessions.get(key);
-    if (existing !== undefined && existing.isAlive()) {
-      if (transportPreference(transportLabel) >= transportPreference(existing.transportLabel)) {
-        peer.close();
-        return { entry: existing, created: false };
-      }
-      existing.stop();
-      existing.close();
-      this.sessions.delete(key);
-    }
     if (existing !== undefined) {
-      existing.stop();
-      existing.close();
+      if (existing.isAlive()) {
+        const existingTier = transportPreference(existing.transportLabel);
+        const newTier = transportPreference(transportLabel);
+        if (newTier > existingTier) {
+          peer.close();
+          return { entry: existing, created: false };
+        }
+        if (
+          newTier === existingTier &&
+          preferKeepExistingSession(existing.locallyInitiated, locallyInitiated)
+        ) {
+          peer.close();
+          return { entry: existing, created: false };
+        }
+        existing.stop();
+        existing.close();
+      } else {
+        existing.stop();
+        existing.close();
+      }
       this.sessions.delete(key);
     }
 
@@ -186,6 +217,7 @@ export class FriendSessionRegistry {
       transportLabel,
       connectedAt: new Date(),
       localAssociationProfile: localAssociationProfile.toLowerCase(),
+      locallyInitiated,
       stop,
       close: () => peer.close(),
       isAlive: () => alive,

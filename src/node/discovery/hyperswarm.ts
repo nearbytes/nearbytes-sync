@@ -25,6 +25,16 @@ function duplexFromSocket(socket: {
   }
   const handlers = new Set<(chunk: Uint8Array) => void>();
   const closeHandlers = new Set<() => void>();
+  let closed = false;
+  const emitClose = (): void => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    for (const handler of closeHandlers) {
+      handler();
+    }
+  };
   socket.on('data', (buf: unknown) => {
     const raw = buf as Buffer;
     const chunk = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
@@ -32,11 +42,8 @@ function duplexFromSocket(socket: {
       handler(chunk);
     }
   });
-  socket.on('close', () => {
-    for (const handler of closeHandlers) {
-      handler();
-    }
-  });
+  socket.on('close', emitClose);
+  socket.on('error', emitClose);
   return {
     write: (chunk) => socket.write(chunk),
     onData: (cb) => {
@@ -88,7 +95,7 @@ export function createHyperswarmDiscovery(options: {
     'connection',
     (
       socket: { on(event: string, cb: (...args: unknown[]) => void): void; write(chunk: Uint8Array): void; end(): void },
-      peerInfo: { publicKey: Buffer; topics?: readonly Buffer[] },
+      peerInfo: { publicKey: Buffer; topics?: readonly Buffer[]; client?: boolean },
     ) => {
       if (!peerHandler) {
         return;
@@ -110,6 +117,7 @@ export function createHyperswarmDiscovery(options: {
           transport: 'duplex',
           label,
           connect: async () => duplex,
+          locallyInitiated: peerInfo.client === true,
           associationProfile: pickAssociationProfile(peerInfo.topics),
         });
       })();
