@@ -579,23 +579,34 @@ export function attachPeerSession(
 
     if (msg.type === 'want') {
       const { blocks, events } = partitionWantRefs(msg.objects);
-      syncDebugLine('wire', `want ← blocks=${blocks.length} events=${events.length}`);
+      let blockServed = 0;
+      let blockMissingLocal = 0;
       for (const ref of blocks) {
         if (ref.kind !== 'block') {
           continue;
         }
         if (!(await log.blocks.has(ref.hash as Hash))) {
+          blockMissingLocal += 1;
           continue;
         }
         if (storageRoot) {
+          blockServed += 1;
           sendBlockStream(log, runOutbound, peer, storageRoot, ref, null, 0, sessionEvents);
           continue;
         }
         const bytes = await readLocalBytes(log, ref);
         if (bytes) {
+          blockServed += 1;
           sendBlockStream(log, runOutbound, peer, storageRoot, ref, bytes, bytes.byteLength, sessionEvents);
         }
       }
+      syncDebugLine(
+        'wire',
+        `want ← blocks=${blocks.length} events=${events.length}` +
+          (blocks.length > 0
+            ? ` served=${blockServed} missing-local=${blockMissingLocal}`
+            : ''),
+      );
       for (const ref of events) {
         const bytes = await readLocalBytes(log, ref);
         if (bytes) {
