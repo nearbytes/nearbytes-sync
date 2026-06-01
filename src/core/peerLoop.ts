@@ -16,7 +16,7 @@ import {
   listLocalReceptionPage,
 } from './receptionSync.js';
 import { buildResumeDelta, buildResumeSubscribe } from './sessionAttach.js';
-import { RECEPTION_ATTACH_TAIL } from './syncConstants.js';
+import { RECEPTION_DEPENDENCY_SCAN_TAIL } from './syncConstants.js';
 import {
   BLOCK_STREAM_WRITE_SLICE_BYTES,
   createWireDecoder,
@@ -411,9 +411,16 @@ export function attachPeerSession(
 
   const missingRefsForWant = async (refs: readonly ObjectRef[]): Promise<ObjectRef[]> => {
     const missing: ObjectRef[] = [];
-    for (const ref of refs) {
-      if (!(await hasObject(log, ref, storageRoot))) {
-        missing.push(ref);
+    const batchSize = 32;
+    for (let i = 0; i < refs.length; i += batchSize) {
+      const batch = refs.slice(i, i + batchSize);
+      const checked = await Promise.all(
+        batch.map(async (ref) => ((await hasObject(log, ref, storageRoot)) ? null : ref)),
+      );
+      for (const ref of checked) {
+        if (ref !== null) {
+          missing.push(ref);
+        }
       }
     }
     return missing;
@@ -580,7 +587,7 @@ export function attachPeerSession(
   const pullAndSendDependencyWants = (urgent = false): Promise<number> => {
     dependencyWantChain = dependencyWantChain.then(async () => {
       const repair = await repairMissingEventDependencyWants(log, storageRoot, {
-        ...(urgent ? { maxEventsPerChannel: RECEPTION_ATTACH_TAIL } : {}),
+        ...(urgent ? { maxEventsPerChannel: RECEPTION_DEPENDENCY_SCAN_TAIL } : {}),
       });
       if (repair.length === 0) {
         return 0;
@@ -607,9 +614,6 @@ export function attachPeerSession(
     }
     send(buildResumeDelta(subject, resumeCursor), true);
     send(buildResumeSubscribe(subject, resumeCursor), true);
-    void pullAndSendDependencyWants(true).catch((err) => {
-      logSyncError('attachDependencyWants', err);
-    });
     void (async () => {
       const out = await listLocalReceptionForConnect(log, storageRoot);
       if (out.refs.length > 0) {
@@ -708,6 +712,10 @@ export function attachPeerSession(
           emptyTailRetried = true;
           syncDebugLine('wire', 'have ← empty at cursor — retry tail delta');
           requestGlobalDelta(lastFetchedCursor, true);
+          if (dependencyWants === 0) {
+            scheduleOrphanRepair();
+          }
+          return;
         }
         if (
           dependencyWants === 0 &&

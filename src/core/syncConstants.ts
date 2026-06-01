@@ -10,6 +10,11 @@ export const RECEPTION_ATTACH_TAIL = Number(
   process.env.NEARBYTES_SYNC_RECEPTION_TAIL ?? 256,
 );
 
+/** Urgent attach / empty-have dependency scan depth (not full orphan repair). */
+export const RECEPTION_DEPENDENCY_SCAN_TAIL = Number(
+  process.env.NEARBYTES_SYNC_DEPENDENCY_TAIL ?? 32,
+);
+
 /** At or below this remote/local max `seq`, anti-entropy uses one full `have` page. */
 export function useInstantReceptionSync(maxSeq: number): boolean {
   return maxSeq > 0 && maxSeq <= RECEPTION_PAGE_LIMIT;

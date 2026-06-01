@@ -1,7 +1,7 @@
 import type { Hash } from 'nearbytes-crypto';
 import type { SerializedEvent } from 'nearbytes-crypto';
 import type { Log } from 'nearbytes-log';
-import { publicKeyFromHex, publicKeyToHex, serializeEvent } from 'nearbytes-log';
+import { publicKeyFromHex, publicKeyToHex } from 'nearbytes-log';
 import { blockReadable } from './blockReadable.js';
 import type { ObjectRef } from './types.js';
 
@@ -9,6 +9,8 @@ export interface RepairDependencyWantsOptions {
   /** When set, only scan the last N events per channel (attach / urgent paths). */
   readonly maxEventsPerChannel?: number;
 }
+
+const REPAIR_BATCH = 16;
 
 /**
  * Declared `blockRefs` on a stored FILES event mix prior event hashes (causal
@@ -93,20 +95,26 @@ export async function repairMissingEventDependencyWants(
       options.maxEventsPerChannel !== undefined && options.maxEventsPerChannel > 0
         ? hashes.slice(-options.maxEventsPerChannel)
         : hashes;
-    for (const eventHash of scan) {
-      try {
-        const signed = await log.events.retrieveEvent(pk, eventHash as Hash);
-        wants.push(
-          ...(await missingDepsFromBlockRefs(
-            log,
-            channelHex,
-            signed.envelope.blockRefs.map((h) => String(h).toLowerCase()),
-            storageRoot,
-            knownEvents,
-          )),
-        );
-      } catch {
-        continue;
+    for (let i = 0; i < scan.length; i += REPAIR_BATCH) {
+      const batch = scan.slice(i, i + REPAIR_BATCH);
+      const batchWants = await Promise.all(
+        batch.map(async (eventHash) => {
+          try {
+            const signed = await log.events.retrieveEvent(pk, eventHash as Hash);
+            return missingDepsFromBlockRefs(
+              log,
+              channelHex,
+              signed.envelope.blockRefs.map((h) => String(h).toLowerCase()),
+              storageRoot,
+              knownEvents,
+            );
+          } catch {
+            return [];
+          }
+        }),
+      );
+      for (const part of batchWants) {
+        wants.push(...part);
       }
     }
   }
