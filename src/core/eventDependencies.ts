@@ -5,6 +5,11 @@ import { publicKeyFromHex, publicKeyToHex, serializeEvent } from 'nearbytes-log'
 import { blockReadable } from './blockReadable.js';
 import type { ObjectRef } from './types.js';
 
+export interface RepairDependencyWantsOptions {
+  /** When set, only scan the last N events per channel (attach / urgent paths). */
+  readonly maxEventsPerChannel?: number;
+}
+
 /**
  * Declared `blockRefs` on a stored FILES event mix prior event hashes (causal
  * head) with content block hashes. After accepting an event out-of-order, ask
@@ -15,6 +20,7 @@ export async function missingInboundEventDependencies(
   channelHex: string,
   bytes: Uint8Array,
   storageRoot?: string,
+  knownEvents?: ReadonlySet<string>,
 ): Promise<ObjectRef[]> {
   let blockRefs: string[];
   try {
@@ -23,6 +29,17 @@ export async function missingInboundEventDependencies(
   } catch {
     return [];
   }
+  return missingDepsFromBlockRefs(log, channelHex, blockRefs, storageRoot, knownEvents);
+}
+
+/** Same as {@link missingInboundEventDependencies} without JSON parse. */
+export async function missingDepsFromBlockRefs(
+  log: Log,
+  channelHex: string,
+  blockRefs: readonly string[],
+  storageRoot?: string,
+  knownEvents?: ReadonlySet<string>,
+): Promise<ObjectRef[]> {
   if (blockRefs.length === 0) {
     return [];
   }
@@ -32,9 +49,9 @@ export async function missingInboundEventDependencies(
     return [];
   }
 
-  const knownEvents = new Set(
-    (await log.events.listEvents(pk)).map((h) => h.toLowerCase()),
-  );
+  const known =
+    knownEvents ??
+    new Set((await log.events.listEvents(pk)).map((h) => h.toLowerCase()));
   const missing: ObjectRef[] = [];
   const channel = channelHex.toLowerCase();
 
@@ -43,7 +60,7 @@ export async function missingInboundEventDependencies(
     if (!(await blockReadable(log, storageRoot, headRef as Hash))) {
       missing.push({ kind: 'block', hash: headRef });
     }
-  } else if (!knownEvents.has(headRef)) {
+  } else if (!known.has(headRef)) {
     missing.push({ kind: 'event', channel, hash: headRef });
   }
 
@@ -51,7 +68,7 @@ export async function missingInboundEventDependencies(
     if (await blockReadable(log, storageRoot, hash as Hash)) {
       continue;
     }
-    if (knownEvents.has(hash)) {
+    if (known.has(hash)) {
       continue;
     }
     missing.push({ kind: 'block', hash });
@@ -61,17 +78,33 @@ export async function missingInboundEventDependencies(
 }
 
 /** Scan local channel events for orphaned heads and return parent/block wants. */
-export async function repairMissingEventDependencyWants(log: Log): Promise<ObjectRef[]> {
+export async function repairMissingEventDependencyWants(
+  log: Log,
+  storageRoot?: string,
+  options: RepairDependencyWantsOptions = {},
+): Promise<ObjectRef[]> {
   const channels = await log.events.listChannels();
   const wants: ObjectRef[] = [];
   for (const pk of channels) {
     const channelHex = publicKeyToHex(pk).toLowerCase();
     const hashes = await log.events.listEvents(pk);
-    for (const eventHash of hashes) {
+    const knownEvents = new Set(hashes.map((h) => h.toLowerCase()));
+    const scan =
+      options.maxEventsPerChannel !== undefined && options.maxEventsPerChannel > 0
+        ? hashes.slice(-options.maxEventsPerChannel)
+        : hashes;
+    for (const eventHash of scan) {
       try {
         const signed = await log.events.retrieveEvent(pk, eventHash as Hash);
-        const bytes = new TextEncoder().encode(JSON.stringify(serializeEvent(signed)));
-        wants.push(...(await missingInboundEventDependencies(log, channelHex, bytes)));
+        wants.push(
+          ...(await missingDepsFromBlockRefs(
+            log,
+            channelHex,
+            signed.envelope.blockRefs.map((h) => String(h).toLowerCase()),
+            storageRoot,
+            knownEvents,
+          )),
+        );
       } catch {
         continue;
       }
