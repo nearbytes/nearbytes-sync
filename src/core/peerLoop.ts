@@ -10,6 +10,12 @@ import {
   missingInboundEventDependencies,
   repairMissingEventDependencyWants,
 } from './eventDependencies.js';
+import { blockReadable } from './blockReadable.js';
+import {
+  listLocalReceptionForConnect,
+  listLocalReceptionPage,
+} from './receptionSync.js';
+import { buildResumeDelta, buildResumeSubscribe } from './sessionAttach.js';
 import {
   BLOCK_STREAM_WRITE_SLICE_BYTES,
   createWireDecoder,
@@ -20,7 +26,12 @@ import type { ObjectRef, Subject, SyncMessage } from './types.js';
 import { appendBenchMarker } from '../benchMarker.js';
 import { logSyncError } from '../logSyncError.js';
 import { syncDebugLine } from '../syncDebugLog.js';
-import { registerLocalHaveAnnouncer, type LocalHaveAnnouncer } from './sessionRegistry.js';
+import { syncTimelineMark } from '../syncTimeline.js';
+import {
+  broadcastLocalHave,
+  registerLocalHaveAnnouncer,
+  type LocalHaveAnnouncer,
+} from './sessionRegistry.js';
 import { inflightBlockRegistry, outboundBlockStreamCounter } from './inflightBlocks.js';
 import {
   NOOP_PEER_SESSION_EVENT_EMITTER,
@@ -96,6 +107,8 @@ export interface AttachPeerSessionOptions {
    * can omit it.
    */
   readonly events?: PeerSessionEventEmitter;
+  /** Stable key for `--debug timeline` (`profile|instance` or discovery label). */
+  readonly timelineKey?: string;
 }
 
 function isMissingLocalObjectError(err: unknown): boolean {
@@ -108,27 +121,71 @@ function isMissingLocalObjectError(err: unknown): boolean {
   return false;
 }
 
-async function toWireRef(log: Log, ref: ReceptionObjectRef): Promise<ObjectRef | null> {
+/** Read `blockRefs` for a `have` advertisement without full event crypto validation. */
+async function blockRefsForEventHave(
+  log: Log,
+  storageRoot: string | undefined,
+  channel: string,
+  eventHash: string,
+): Promise<string[] | undefined> {
+  if (storageRoot === undefined) {
+    return undefined;
+  }
+  try {
+    const raw = await readFile(join(storageRoot, 'channels', channel, `${eventHash}.bin`), 'utf8');
+    const parsed = JSON.parse(raw) as { envelope?: { blockRefs?: unknown } };
+    if (!Array.isArray(parsed.envelope?.blockRefs)) {
+      return [];
+    }
+    const blockRefs: string[] = [];
+    for (const h of parsed.envelope.blockRefs) {
+      const hash = String(h);
+      if (await blockReadable(log, storageRoot, hash as Hash)) {
+        blockRefs.push(hash);
+      }
+    }
+    return blockRefs;
+  } catch {
+    return undefined;
+  }
+}
+
+async function toWireRef(
+  log: Log,
+  ref: ReceptionObjectRef,
+  storageRoot?: string,
+): Promise<ObjectRef | null> {
   if (ref.kind === 'block') {
     return { kind: 'block', hash: ref.hash };
   }
-  const pk = publicKeyFromHex(ref.channel);
+  const channel = ref.channel;
+  const hash = ref.hash;
+  const peeked = await blockRefsForEventHave(log, storageRoot, channel, hash);
+  if (peeked !== undefined) {
+    return {
+      kind: 'event',
+      channel,
+      hash,
+      ...(peeked.length > 0 ? { blockRefs: peeked } : {}),
+    };
+  }
+  const pk = publicKeyFromHex(channel);
   if (!pk) {
-    return { kind: 'event', channel: ref.channel, hash: ref.hash };
+    return { kind: 'event', channel, hash };
   }
   try {
-    const event = await log.events.retrieveEvent(pk, ref.hash as Hash);
+    const event = await log.events.retrieveEvent(pk, hash as Hash);
     const blockRefs: string[] = [];
     for (const h of event.envelope.blockRefs) {
-      const hash = h as Hash;
-      if (await log.blocks.has(hash)) {
-        blockRefs.push(hash as string);
+      const blockHash = h as Hash;
+      if (await blockReadable(log, storageRoot, blockHash)) {
+        blockRefs.push(blockHash as string);
       }
     }
     return {
       kind: 'event',
-      channel: ref.channel,
-      hash: ref.hash,
+      channel,
+      hash,
       ...(blockRefs.length > 0 ? { blockRefs } : {}),
     };
   } catch (err) {
@@ -136,7 +193,7 @@ async function toWireRef(log: Log, ref: ReceptionObjectRef): Promise<ObjectRef |
       return null;
     }
     logSyncError('toWireRef', err);
-    return { kind: 'event', channel: ref.channel, hash: ref.hash };
+    return { kind: 'event', channel, hash };
   }
 }
 
@@ -157,9 +214,13 @@ async function readLocalBytes(log: Log, ref: ObjectRef): Promise<Uint8Array | nu
   }
 }
 
-async function hasObject(log: Log, ref: ObjectRef): Promise<boolean> {
+async function hasObject(
+  log: Log,
+  ref: ObjectRef,
+  storageRoot?: string,
+): Promise<boolean> {
   if (ref.kind === 'block') {
-    return log.blocks.has(ref.hash as Hash);
+    return blockReadable(log, storageRoot, ref.hash as Hash);
   }
   const pk = publicKeyFromHex(ref.channel);
   if (!pk) {
@@ -170,43 +231,28 @@ async function hasObject(log: Log, ref: ObjectRef): Promise<boolean> {
 }
 
 /** Reception journal may list objects evicted from blocks/ or channels/ — do not advertise them. */
-async function receptionRefLocallyAvailable(log: Log, ref: ReceptionObjectRef): Promise<boolean> {
-  if (ref.kind === 'block') {
-    return log.blocks.has(ref.hash as Hash);
-  }
-  const pk = publicKeyFromHex(ref.channel);
-  if (!pk) {
-    return false;
-  }
-  try {
-    await log.events.retrieveEvent(pk, ref.hash as Hash);
-    return true;
-  } catch {
-    return false;
-  }
+async function receptionRefLocallyAvailable(
+  log: Log,
+  ref: ReceptionObjectRef,
+  storageRoot?: string,
+): Promise<boolean> {
+  return hasObject(
+    log,
+    ref.kind === 'block'
+      ? { kind: 'block', hash: ref.hash }
+      : { kind: 'event', channel: ref.channel, hash: ref.hash },
+    storageRoot,
+  );
 }
 
-async function readLocalReceptionMaxSeq(storageRoot: string | undefined): Promise<number> {
-  if (storageRoot === undefined) {
-    return 0;
-  }
-  try {
-    const raw = await readFile(join(storageRoot, 'sync', 'reception.jsonl'), 'utf8');
-    const lines = raw.trim().split('\n').filter((line) => line.length > 0);
-    if (lines.length === 0) {
-      return 0;
-    }
-    const parsed = JSON.parse(lines[lines.length - 1]!) as { seq?: unknown };
-    return typeof parsed.seq === 'number' ? parsed.seq : Number.parseInt(String(parsed.seq), 10) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-async function missingRefs(log: Log, refs: readonly ObjectRef[]): Promise<ObjectRef[]> {
+async function missingRefs(
+  log: Log,
+  refs: readonly ObjectRef[],
+  storageRoot?: string,
+): Promise<ObjectRef[]> {
   const missing: ObjectRef[] = [];
   for (const ref of refs) {
-    if (!(await hasObject(log, ref))) {
+    if (!(await hasObject(log, ref, storageRoot))) {
       missing.push(ref);
     }
   }
@@ -360,33 +406,18 @@ export function attachPeerSession(
    * incoming stream for that hash completes (any outcome) or on session stop.
    */
   const inflight = inflightBlockRegistry(log);
-  /** Block hashes the peer asked for that we cannot serve — do not re-want every page. */
-  const unsatisfiableBlockWants = new Set<string>();
   const claimedHashes = new Set<string>();
 
   const missingRefsForWant = async (refs: readonly ObjectRef[]): Promise<ObjectRef[]> => {
     const missing: ObjectRef[] = [];
     for (const ref of refs) {
-      if (ref.kind === 'block') {
-        const key = ref.hash.toLowerCase();
-        if (unsatisfiableBlockWants.has(key)) {
-          continue;
-        }
-      }
-      if (!(await hasObject(log, ref))) {
+      if (!(await hasObject(log, ref, storageRoot))) {
         missing.push(ref);
       }
     }
     return missing;
   };
 
-  const tailReceptionCursor = async (): Promise<string | undefined> => {
-    const maxSeq = await readLocalReceptionMaxSeq(storageRoot);
-    if (maxSeq <= 0) {
-      return undefined;
-    }
-    return String(Math.max(-1, maxSeq - 256));
-  };
   const claimBlockWant = (hash: string): boolean => {
     const key = hash.toLowerCase();
     if (claimedHashes.has(key)) return true;
@@ -407,6 +438,9 @@ export function attachPeerSession(
     nextCursor?: string,
     urgent = false,
   ): Promise<void> => {
+    if (process.env.NBF_PROP_TRACE === '1') {
+      console.error(`[nearbytes-sync] sendHave in n=${refs.length} urgent=${urgent}`);
+    }
     if (refs.length === 0 && !more) {
       send({ type: 'have', subject, objects: [], more: false }, urgent);
       return;
@@ -414,11 +448,21 @@ export function attachPeerSession(
     const objects: ObjectRef[] = [];
     let skippedUnavailable = 0;
     for (const ref of refs) {
-      if (!(await receptionRefLocallyAvailable(log, ref))) {
+      if (process.env.NBF_PROP_TRACE === '1') {
+        console.error(`[nearbytes-sync] sendHave ref ${ref.kind}`);
+      }
+      const available = await receptionRefLocallyAvailable(log, ref, storageRoot);
+      if (process.env.NBF_PROP_TRACE === '1') {
+        console.error(`[nearbytes-sync] sendHave avail ${ref.kind}=${available}`);
+      }
+      if (!available) {
         skippedUnavailable += 1;
         continue;
       }
-      const wireRef = await toWireRef(log, ref);
+      const wireRef = await toWireRef(log, ref, storageRoot);
+      if (process.env.NBF_PROP_TRACE === '1') {
+        console.error(`[nearbytes-sync] sendHave wire ${ref.kind} ok=${wireRef !== null}`);
+      }
       if (wireRef !== null) {
         objects.push(wireRef);
       }
@@ -429,7 +473,17 @@ export function attachPeerSession(
         `have filter skipped ${skippedUnavailable}/${refs.length} reception ref(s) not on disk`,
       );
     }
+    if (process.env.NBF_PROP_TRACE === '1') {
+      console.error(
+        `[nearbytes-sync] sendHave built objects=${objects.length} skipped=${skippedUnavailable}`,
+      );
+    }
     if (objects.length === 0 && refs.length > 0) {
+      if (process.env.NBF_PROP_TRACE === '1') {
+        console.error(
+          `[nearbytes-sync] have → dropped all ${refs.length} ref(s) (skippedUnavailable=${skippedUnavailable})`,
+        );
+      }
       syncDebugLine(
         'wire',
         `have → page had ${refs.length} journal ref(s) but none are locally available`,
@@ -454,23 +508,25 @@ export function attachPeerSession(
     syncDebugLine(
       'wire',
       `have → objects=${objects.length} more=${more}` +
-        (effectiveNext !== undefined ? ` next=${effectiveNext}` : ''),
+        (effectiveNext !== undefined ? ` next=${effectiveNext}` : '') +
+        (process.env.NBF_PROP_TRACE === '1'
+          ? ` kinds=${objects.map((o) => o.kind).join(',')}`
+          : ''),
     );
   };
 
-  const requestGlobalDelta = (cursor?: string): void => {
-    syncDebugLine('wire', `delta → global cursor=${cursor ?? '(start)'} limit=256`);
-    send({
-      type: 'delta',
-      subject,
-      mode: 'global',
-      ...(cursor !== undefined ? { cursor } : {}),
-      limit: 256,
-    });
+  const requestGlobalDelta = (cursor?: string, urgent = false): void => {
+    syncDebugLine('wire', `delta → global cursor=${cursor ?? 'start'}`);
+    send(buildResumeDelta(subject, cursor), urgent);
   };
 
   const sendWants = (refs: readonly ObjectRef[]): void => {
     const { blocks, events } = partitionWantRefs(refs);
+    const tl = options.timelineKey;
+    if (tl !== undefined && !timelineWantOutLogged && (blocks.length > 0 || events.length > 0)) {
+      timelineWantOutLogged = true;
+      syncTimelineMark(tl, 'want→', `blocks=${blocks.length} events=${events.length}`);
+    }
     if (blocks.length > 0) {
       syncDebugLine('wire', `want → blocks=${blocks.length}`);
       send({ type: 'want', objects: blocks });
@@ -510,7 +566,7 @@ export function attachPeerSession(
         await inboundWire;
         const repair = await repairMissingEventDependencyWants(log);
         if (repair.length > 0) {
-          const wants = await missingRefs(log, repair);
+          const wants = await missingRefs(log, repair, storageRoot);
           if (wants.length > 0) {
             sendWants(wants);
           }
@@ -522,34 +578,38 @@ export function attachPeerSession(
       });
   };
 
-  /**
-   * When a peer attaches, advertise the tail of our reception journal so a
-   * late joiner (or a peer with a stale fetch cursor) still sees recent writes
-   * made while it was offline — mutual `delta` alone is not always enough.
-   *
-   * Runs immediately (not behind `inboundWire`) so a joiner's first `subscribe`
-   * cannot win the race and advance a false fetch cursor before we announce.
-   */
-  const pushProactiveReceptionTail = (): void => {
+  let timelineHaveInLogged = false;
+  let timelineWantOutLogged = false;
+
+  /** On attach: urgent resume from persisted cursor + announce our journal (SYNC-21c tail). */
+  const runAttachSync = (): void => {
+    const resumeCursor = options.initialFetchCursor;
+    const tl = options.timelineKey;
+    syncDebugLine('wire', `attach → resume remote cursor=${resumeCursor ?? 'start'}`);
+    if (tl !== undefined) {
+      syncTimelineMark(tl, 'resume-sent', `cursor=${resumeCursor ?? 'start'}`);
+    }
+    send(buildResumeDelta(subject, resumeCursor), true);
+    send(buildResumeSubscribe(subject, resumeCursor), true);
     void (async () => {
-      const maxSeq = await readLocalReceptionMaxSeq(storageRoot);
-      if (maxSeq <= 0) {
-        return;
-      }
-      const window = 256;
-      const start = Math.max(-1, maxSeq - window);
-      const out = await log.reception.listAfter(String(start), window);
+      const out = await listLocalReceptionForConnect(log, storageRoot);
       if (out.refs.length > 0) {
+        syncDebugLine('wire', `attach → announce local objects=${out.refs.length}`);
+        if (tl !== undefined) {
+          syncTimelineMark(tl, 'announce-sent', `objects=${out.refs.length}`);
+        }
         await sendHave(out.refs, out.more, out.next, true);
       }
     })().catch((err) => {
-      logSyncError('proactiveReceptionTail', err);
+      logSyncError('attachAnnounce', err);
     });
   };
 
   const announcer: LocalHaveAnnouncer = {
     pushLocalHave(refs) {
-      void sendHave(refs, false, undefined, true);
+      void sendHave(refs, false, undefined, true).catch((err) => {
+        logSyncError('pushLocalHave', err);
+      });
     },
   };
   const unregister = registerLocalHaveAnnouncer(announcer);
@@ -560,18 +620,27 @@ export function attachPeerSession(
     }
 
     if (msg.type === 'delta' && msg.mode === 'global') {
-      const out = await log.reception.listAfter(msg.cursor, msg.limit);
-      await sendHave(out.refs, out.more, out.next);
+      const out = await listLocalReceptionPage(log, storageRoot, msg.cursor);
+      await sendHave(out.refs, out.more, out.next, true);
       return;
     }
 
     if (msg.type === 'subscribe' && msg.delta.mode === 'global') {
-      const out = await log.reception.listAfter(msg.delta.cursor, msg.delta.limit ?? 256);
-      await sendHave(out.refs, out.more, out.next);
+      const out = await listLocalReceptionPage(log, storageRoot, msg.delta.cursor);
+      await sendHave(out.refs, out.more, out.next, true);
       return;
     }
 
     if (msg.type === 'have') {
+      const tl = options.timelineKey;
+      if (tl !== undefined && !timelineHaveInLogged) {
+        timelineHaveInLogged = true;
+        syncTimelineMark(
+          tl,
+          'have←',
+          `objects=${msg.objects.length} more=${msg.more}`,
+        );
+      }
       syncDebugLine(
         'wire',
         `have ← objects=${msg.objects.length} more=${msg.more}` +
@@ -598,7 +667,7 @@ export function attachPeerSession(
             .then(async () => {
               await inboundWire;
               await flushPendingPageCursor();
-              requestGlobalDelta(msg.nextCursor);
+              requestGlobalDelta(msg.nextCursor, true);
             })
             .catch((err) => {
               logSyncError('havePageContinue', err);
@@ -609,35 +678,25 @@ export function attachPeerSession(
         return;
       }
       if (msg.more && msg.nextCursor) {
-        requestGlobalDelta(msg.nextCursor);
+        requestGlobalDelta(msg.nextCursor, true);
+      } else if (msg.objects.length === 0 && !msg.more) {
+        if (
+          !emptyCatchupRewound &&
+          lastFetchedCursor !== undefined &&
+          lastFetchedCursor !== ''
+        ) {
+          emptyCatchupRewound = true;
+          lastFetchedCursor = undefined;
+          pendingPageCursor = undefined;
+          syncDebugLine('wire', 'have ← empty at cursor — restart from start');
+          requestGlobalDelta(undefined, true);
+        } else if (msg.nextCursor !== undefined) {
+          await checkpointFetchCursor(msg.nextCursor);
+          lastFetchedCursor = msg.nextCursor;
+        }
+        scheduleOrphanRepair();
       } else {
-        if (msg.objects.length === 0) {
-          const storedCursor =
-            options.initialFetchCursor !== undefined
-              ? Number.parseInt(options.initialFetchCursor, 10)
-              : undefined;
-          const localMaxSeq = await readLocalReceptionMaxSeq(storageRoot);
-          if (
-            storedCursor !== undefined &&
-            Number.isFinite(storedCursor) &&
-            storedCursor > localMaxSeq
-          ) {
-            lastFetchedCursor = undefined;
-            pendingPageCursor = undefined;
-            syncDebugLine('wire', 'have ← empty page — stale fetch cursor, catch up from reception tail');
-            requestGlobalDelta(await tailReceptionCursor());
-          } else if (
-            !emptyCatchupRewound &&
-            options.initialFetchCursor !== undefined &&
-            options.initialFetchCursor !== ''
-          ) {
-            emptyCatchupRewound = true;
-            lastFetchedCursor = undefined;
-            pendingPageCursor = undefined;
-            syncDebugLine('wire', 'have ← empty terminal page — rewind to reception tail');
-            requestGlobalDelta(await tailReceptionCursor());
-          }
-        } else if (msg.nextCursor) {
+        if (msg.nextCursor !== undefined) {
           await checkpointFetchCursor(msg.nextCursor);
           lastFetchedCursor = msg.nextCursor;
         }
@@ -647,6 +706,10 @@ export function attachPeerSession(
     }
 
     if (msg.type === 'want') {
+      syncDebugLine(
+        'wire',
+        `want ← blocks=${msg.objects.filter((o) => o.kind === 'block').length} events=${msg.objects.filter((o) => o.kind === 'event').length}`,
+      );
       const { blocks, events } = partitionWantRefs(msg.objects);
       let blockServed = 0;
       let blockMissingLocal = 0;
@@ -654,9 +717,8 @@ export function attachPeerSession(
         if (ref.kind !== 'block') {
           continue;
         }
-        if (!(await log.blocks.has(ref.hash as Hash))) {
+        if (!(await blockReadable(log, storageRoot, ref.hash as Hash))) {
           blockMissingLocal += 1;
-          unsatisfiableBlockWants.add(ref.hash.toLowerCase());
           continue;
         }
         if (storageRoot) {
@@ -668,6 +730,8 @@ export function attachPeerSession(
         if (bytes) {
           blockServed += 1;
           sendBlockStream(log, runOutbound, peer, storageRoot, ref, bytes, bytes.byteLength, sessionEvents);
+        } else {
+          blockMissingLocal += 1;
         }
       }
       syncDebugLine(
@@ -712,9 +776,10 @@ export function attachPeerSession(
           log,
           msg.object.channel,
           msg.bytes,
+          storageRoot,
         );
         if (deps.length > 0) {
-          const wants = await missingRefs(log, deps);
+          const wants = await missingRefs(log, deps, storageRoot);
           if (wants.length > 0) {
             sendWants(wants);
           }
@@ -784,7 +849,12 @@ export function attachPeerSession(
   };
 
   const markBlockStored = async (hash: string, bytes: number): Promise<void> => {
-    await log.reception.appendReception({ kind: 'block', hash: hash as Hash });
+    const blockRef = { kind: 'block' as const, hash: hash as Hash };
+    const rawAppend =
+      (log.reception as { appendReceptionRaw?: (ref: ReceptionObjectRef) => Promise<string> })
+        .appendReceptionRaw ?? log.reception.appendReception.bind(log.reception);
+    await rawAppend(blockRef);
+    broadcastLocalHave([blockRef]);
     await appendBenchMarker(log, 'inbound-stored', {
       kind: 'block',
       hash: hash.slice(0, 16),
@@ -899,34 +969,10 @@ export function attachPeerSession(
       }
       const sink = diskBlockStream.create(hash, total);
       incoming = { mode: 'disk', hash, total, sink };
-      // Fast path: bypass ingestStreamBytes; the sink is the only consumer here.
-      // The exclusive-inbound stream can deliver a chunk that crosses the
-      // stream boundary (i.e. last bytes of this stream + the next frame).
-      // We pass only the in-stream bytes to the sink and re-dispatch any
-      // leftover through the wire decoder so the codec returns to control
-      // mode without losing the next `block-stream-begin` frame.
-      const directDiskIngest = (chunk: Uint8Array): void => {
-        const remaining = total - sink.received;
-        const chunkLen = chunk.byteLength;
-        const take = remaining < chunkLen ? remaining : chunkLen;
-        sink.ingest(take === chunkLen ? chunk : chunk.subarray(0, take));
-        if (sink.received >= total) {
-          void finishIncomingStream().catch((err) =>
-            logSyncError('finishIncomingStream', err),
-          );
-          if (take < chunkLen) {
-            decodeControl(chunk.subarray(take));
-          }
-        }
-      };
-      if (peer.setExclusiveInbound) {
-        peer.setExclusiveInbound(directDiskIngest);
-      } else {
-        peer.setBulkInbound?.(directDiskIngest);
-      }
+      // Keep the wire decoder on the socket so urgent `have` / event frames can
+      // interleave with block-stream bytes (exclusive/bulk inbound swallowed them).
       return;
     }
-    peer.setBulkInbound?.(ingestStreamBytes);
     if (total > MAX_BLOCK_STREAM_BUFFER_BYTES) {
       throw new Error(`block stream ${total} B exceeds in-memory limit ${MAX_BLOCK_STREAM_BUFFER_BYTES}`);
     }
@@ -955,27 +1001,20 @@ export function attachPeerSession(
     onBlockStreamBytes: ingestStreamBytes,
   });
 
-  peer.onData(decodeControl);
+  peer.onData((chunk) => {
+    try {
+      decodeControl(chunk);
+    } catch (err) {
+      logSyncError('wire decode', err);
+      peer.close();
+    }
+  });
   for (const message of options.initialMessages ?? []) {
     runInbound(() => onMessage(message));
   }
   peer.resumeInbound?.();
 
-  pushProactiveReceptionTail();
-
-  send({
-    type: 'subscribe',
-    delta: {
-      type: 'delta',
-      subject,
-      mode: 'global',
-      limit: 256,
-      ...(options.initialFetchCursor !== undefined
-        ? { cursor: options.initialFetchCursor }
-        : {}),
-    },
-  });
-  scheduleOrphanRepair();
+  runAttachSync();
 
   const stop = (): void => {
     unregister();

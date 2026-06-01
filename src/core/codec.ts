@@ -181,14 +181,7 @@ export function createWireDecoder(handlers: WireDecoderHandlers): WireDecoder {
         }
         const hash = bytesToHex(body.subarray(1, 33));
         const total = readU64BE(new DataView(body.buffer, body.byteOffset, body.byteLength), 33);
-        if (handlers.onBlockStreamBytes && handlers.peerBulkBlockStream) {
-          handlers.onBlockStreamBegin?.(hash, total);
-          if (frameBuf.length > 0) {
-            const pending = frameBuf;
-            frameBuf = new Uint8Array(0);
-            handlers.onBlockStreamBytes(pending);
-          }
-        } else if (handlers.onBlockStreamBytes) {
+        if (handlers.onBlockStreamBytes) {
           streamTotal = total;
           streamReceived = 0;
           handlers.onBlockStreamBegin?.(hash, streamTotal);

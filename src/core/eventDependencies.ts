@@ -2,6 +2,7 @@ import type { Hash } from 'nearbytes-crypto';
 import type { SerializedEvent } from 'nearbytes-crypto';
 import type { Log } from 'nearbytes-log';
 import { publicKeyFromHex, publicKeyToHex, serializeEvent } from 'nearbytes-log';
+import { blockReadable } from './blockReadable.js';
 import type { ObjectRef } from './types.js';
 
 /**
@@ -13,6 +14,7 @@ export async function missingInboundEventDependencies(
   log: Log,
   channelHex: string,
   bytes: Uint8Array,
+  storageRoot?: string,
 ): Promise<ObjectRef[]> {
   let blockRefs: string[];
   try {
@@ -38,7 +40,7 @@ export async function missingInboundEventDependencies(
 
   const headRef = blockRefs[0]!;
   if (blockRefs.length === 1) {
-    if (!(await log.blocks.has(headRef as Hash))) {
+    if (!(await blockReadable(log, storageRoot, headRef as Hash))) {
       missing.push({ kind: 'block', hash: headRef });
     }
   } else if (!knownEvents.has(headRef)) {
@@ -46,7 +48,7 @@ export async function missingInboundEventDependencies(
   }
 
   for (const hash of blockRefs.slice(1)) {
-    if (await log.blocks.has(hash as Hash)) {
+    if (await blockReadable(log, storageRoot, hash as Hash)) {
       continue;
     }
     if (knownEvents.has(hash)) {

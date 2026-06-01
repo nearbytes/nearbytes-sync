@@ -1,5 +1,6 @@
 import type { Socket } from 'net';
 import type { DuplexPeer } from '../core/peerLoop.js';
+import { logSyncError } from '../logSyncError.js';
 
 /** Node TCP peer with direct socket access for nc-style bulk block I/O. */
 export type TcpDuplexPeer = DuplexPeer & {
@@ -110,7 +111,8 @@ export function duplexFromTcpSocket(socket: Socket): TcpDuplexPeer {
   return {
     tcpSocket: socket,
     write: (chunk) => {
-      void writeSocket(socket, chunk).catch(() => {
+      void writeSocket(socket, chunk).catch((err) => {
+        logSyncError('tcp write', err);
         socket.destroy();
       });
     },

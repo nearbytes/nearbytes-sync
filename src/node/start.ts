@@ -6,6 +6,14 @@ import { connectDiscoveredPeer } from './connect.js';
 import { createHyperswarmDiscovery } from './discovery/hyperswarm.js';
 import { createMdnsDiscovery } from './discovery/mdns.js';
 import { appendBenchMarker } from '../benchMarker.js';
+import { syncDebugLine } from '../syncDebugLog.js';
+import {
+  isSyncTimelineEnabled,
+  syncTimelineClear,
+  syncTimelineHandoff,
+  syncTimelineKey,
+  syncTimelineMark,
+} from '../syncTimeline.js';
 import { patchLogForReactiveHave } from '../core/sessionRegistry.js';
 import {
   logSyncError,
@@ -325,6 +333,59 @@ export async function start(
     }
   });
 
+  const timelineDataSeen = new Map<string, { event: boolean; block: boolean; blockCount: number }>();
+  if (isSyncTimelineEnabled()) {
+    eventBus.onEvent((e) => {
+      switch (e.kind) {
+        case 'event-received': {
+          const key = syncTimelineKey(e.fromProfile, e.fromInstancePublicKey);
+          let seen = timelineDataSeen.get(key);
+          if (seen === undefined) {
+            seen = { event: false, block: false, blockCount: 0 };
+            timelineDataSeen.set(key, seen);
+          }
+          if (!seen.event) {
+            seen.event = true;
+            syncTimelineMark(key, 'event←', `hash=${e.eventHash.slice(0, 8)}`);
+          }
+          break;
+        }
+        case 'block-received': {
+          const key = syncTimelineKey(e.fromProfile, e.fromInstancePublicKey);
+          let seen = timelineDataSeen.get(key);
+          if (seen === undefined) {
+            seen = { event: false, block: false, blockCount: 0 };
+            timelineDataSeen.set(key, seen);
+          }
+          seen.blockCount += 1;
+          if (!seen.block) {
+            seen.block = true;
+            syncTimelineMark(key, 'block←', `hash=${e.blockHash.slice(0, 8)}`);
+          } else if (seen.blockCount === 2) {
+            syncTimelineMark(key, 'blocks←', 'more incoming…');
+          }
+          break;
+        }
+        case 'peer-disconnected': {
+          const key = syncTimelineKey(e.remoteProfilePublicKey, e.remoteInstancePublicKey);
+          const seen = timelineDataSeen.get(key);
+          if (seen !== undefined && seen.blockCount > 1) {
+            syncTimelineMark(key, 'blocks-done', `count=${seen.blockCount}`);
+          }
+          timelineDataSeen.delete(key);
+          syncTimelineClear(key);
+          break;
+        }
+        case 'peer-connect-failed':
+          syncTimelineMark(e.transportLabel, 'connect-failed', `${e.reason} attempts=${e.attempts}`);
+          syncTimelineClear(e.transportLabel);
+          break;
+        default:
+          break;
+      }
+    });
+  }
+
   const friendSessions = new FriendSessionRegistry(eventBus);
   const connectingPairs = new Set<string>();
   const handshakingDuplexes = new WeakSet<DuplexPeer>();
@@ -365,11 +426,15 @@ export async function start(
     let remoteProfileHint = expectedRemote?.toLowerCase();
     let pairKeyOptimistic: string | null = null;
     const connectScope = `friend-connect:${discovered.label}`;
+    const timelineLabelKey = discovered.label;
     void (async () => {
       for (let attempt = 1; attempt <= FRIEND_CONNECT_MAX_ATTEMPTS; attempt++) {
       let duplex: DuplexPeer | undefined;
+      let timelineKey = timelineLabelKey;
       try {
+        syncTimelineMark(timelineLabelKey, 'connect-start', `attempt=${attempt}`);
         duplex = await connectDiscoveredPeer(discovered);
+        syncTimelineMark(timelineLabelKey, 'tcp-connected');
         if (handshakingDuplexes.has(duplex)) {
           return;
         }
@@ -397,6 +462,12 @@ export async function start(
             discovered.transport === 'duplex' ? DHT_HANDSHAKE_TIMEOUT_MS : undefined,
         });
         remoteProfileHint = remoteProfile;
+        timelineKey = syncTimelineHandoff(timelineLabelKey, remoteProfile, remoteInstancePublicKey);
+        syncTimelineMark(
+          timelineKey,
+          'hello-done',
+          `profile=${remoteProfile.slice(0, 8)} inst=${remoteInstancePublicKey.slice(0, 8)}`,
+        );
 
         // Pair key includes the remote instance so two sibling devices
         // (same profile, different dataDir instance) each get their own
@@ -405,12 +476,30 @@ export async function start(
         await acquirePairSlot(pairKey);
         pairKeyOptimistic = pairKey;
         try {
+          if (friendSessions.hasAliveSession(remoteProfile, remoteInstancePublicKey)) {
+            syncDebugLine(
+              'wire',
+              `duplicate connect dropped remote=${remoteProfile.slice(0, 12)} inst=${remoteInstancePublicKey.slice(0, 8)}`,
+            );
+            duplex.close();
+            return;
+          }
+
           await appendBenchMarker(log, 'peer-connected', {
             transport: discovered.transport,
             label: discovered.label.slice(0, 64),
           });
 
           const storageRoot = options.blockStorageRoot;
+          const initialFetchCursor = await fetchCursors.get(
+            remoteProfile,
+            remoteInstancePublicKey,
+          );
+          syncTimelineMark(
+            timelineKey,
+            'cursor-loaded',
+            initialFetchCursor ?? 'start',
+          );
           const { created } = friendSessions.attach(
             log,
             remoteProfile,
@@ -419,8 +508,9 @@ export async function start(
             duplex,
             {
               blockStorageRoot: storageRoot,
-              initialFetchCursor: await fetchCursors.get(remoteProfile, remoteInstancePublicKey),
+              initialFetchCursor,
               initialMessages: earlyMessages,
+              timelineKey,
               onFetchCursorCheckpoint: (cursor) =>
                 fetchCursors.put(remoteProfile, remoteInstancePublicKey, cursor).catch((err) =>
                   logSyncError('fetchCursorCheckpoint', err),
@@ -434,6 +524,7 @@ export async function start(
             discovered.transport === 'duplex' && discovered.locallyInitiated === true,
           );
           if (created) {
+            syncTimelineMark(timelineKey, 'session-attached');
             await appendBenchMarker(log, 'friend-session-attached', {
               remote: remoteProfile.slice(0, 16),
               remotePeerId: remotePeerId.slice(0, 16),
@@ -513,6 +604,11 @@ export async function start(
   };
 
   discovery.onPeer((discovered) => {
+    syncTimelineMark(
+      discovered.label,
+      'discovered',
+      `transport=${discovered.transport}`,
+    );
     const association =
       discovered.transport === 'tcp'
         ? discovered.associationProfile

@@ -1,6 +1,7 @@
 import type { Log } from 'nearbytes-log';
 import { attachPeerSession, type AttachPeerSessionOptions, type DuplexPeer } from './peerLoop.js';
 import { profileSubject } from './topic.js';
+import { syncDebugLine } from '../syncDebugLog.js';
 import type { PeerSessionEventEmitter, SyncEventBus } from './syncEvents.js';
 
 export interface FriendSessionEntry {
@@ -166,16 +167,26 @@ export class FriendSessionRegistry {
         const existingTier = transportPreference(existing.transportLabel);
         const newTier = transportPreference(transportLabel);
         if (newTier > existingTier) {
+          syncDebugLine('wire', `session reject worse duplicate ${transportLabel}`);
           peer.close();
           return { entry: existing, created: false };
         }
-        if (
-          newTier === existingTier &&
-          preferKeepExistingSession(existing.locallyInitiated, locallyInitiated)
-        ) {
+        if (newTier === existingTier) {
+          // Never replace a live same-tier leg: a duplicate mdns accept while an
+          // outbound dial is in flight used to ECONNRESET mid `want`/`data`.
+          syncDebugLine('wire', `session reject same-tier duplicate ${transportLabel}`);
           peer.close();
           return { entry: existing, created: false };
         }
+        if (preferKeepExistingSession(existing.locallyInitiated, locallyInitiated)) {
+          syncDebugLine('wire', `session reject duplicate ${transportLabel}`);
+          peer.close();
+          return { entry: existing, created: false };
+        }
+        syncDebugLine(
+          'wire',
+          `session replace ${existing.transportLabel} -> ${transportLabel}`,
+        );
         existing.stop();
         existing.close();
       } else {

@@ -39,6 +39,12 @@ export {
   type SyncDebugSink,
 } from '../syncDebugLog.js';
 export {
+  configureSyncTimeline,
+  isSyncTimelineEnabled,
+  syncTimelineMark,
+  syncTimelineKey,
+} from '../syncTimeline.js';
+export {
   readDaemonConfig,
   defaultDaemonConfigPath,
   defaultDaemonDataDir,
