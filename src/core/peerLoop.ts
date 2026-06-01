@@ -564,18 +564,25 @@ export function attachPeerSession(
     orphanRepairChain = orphanRepairChain
       .then(async () => {
         await inboundWire;
-        const repair = await repairMissingEventDependencyWants(log);
-        if (repair.length > 0) {
-          const wants = await missingRefs(log, repair, storageRoot);
-          if (wants.length > 0) {
-            sendWants(wants);
-          }
-        }
+        await pullAndSendDependencyWants();
         await flushPendingPageCursor();
       })
       .catch((err) => {
         logSyncError('orphanRepair', err);
       });
+  };
+
+  /** Scan local event chains for missing blocks/parents; return wants actually sent. */
+  const pullAndSendDependencyWants = async (): Promise<number> => {
+    const repair = await repairMissingEventDependencyWants(log);
+    if (repair.length === 0) {
+      return 0;
+    }
+    const wants = await missingRefs(log, repair, storageRoot);
+    if (wants.length > 0) {
+      sendWants(wants);
+    }
+    return wants.length;
   };
 
   let timelineHaveInLogged = false;
@@ -591,6 +598,9 @@ export function attachPeerSession(
     }
     send(buildResumeDelta(subject, resumeCursor), true);
     send(buildResumeSubscribe(subject, resumeCursor), true);
+    void pullAndSendDependencyWants().catch((err) => {
+      logSyncError('attachDependencyWants', err);
+    });
     void (async () => {
       const out = await listLocalReceptionForConnect(log, storageRoot);
       if (out.refs.length > 0) {
@@ -680,7 +690,9 @@ export function attachPeerSession(
       if (msg.more && msg.nextCursor) {
         requestGlobalDelta(msg.nextCursor, true);
       } else if (msg.objects.length === 0 && !msg.more) {
+        const dependencyWants = await pullAndSendDependencyWants();
         if (
+          dependencyWants === 0 &&
           !emptyCatchupRewound &&
           lastFetchedCursor !== undefined &&
           lastFetchedCursor !== ''
@@ -693,8 +705,12 @@ export function attachPeerSession(
         } else if (msg.nextCursor !== undefined) {
           await checkpointFetchCursor(msg.nextCursor);
           lastFetchedCursor = msg.nextCursor;
+        } else if (lastFetchedCursor !== undefined && lastFetchedCursor !== '') {
+          await checkpointFetchCursor(lastFetchedCursor);
         }
-        scheduleOrphanRepair();
+        if (dependencyWants === 0) {
+          scheduleOrphanRepair();
+        }
       } else {
         if (msg.nextCursor !== undefined) {
           await checkpointFetchCursor(msg.nextCursor);
