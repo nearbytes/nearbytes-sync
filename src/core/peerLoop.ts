@@ -163,6 +163,23 @@ async function hasObject(log: Log, ref: ObjectRef): Promise<boolean> {
   return events.includes(ref.hash as Hash);
 }
 
+/** Reception journal may list objects evicted from blocks/ or channels/ — do not advertise them. */
+async function receptionRefLocallyAvailable(log: Log, ref: ReceptionObjectRef): Promise<boolean> {
+  if (ref.kind === 'block') {
+    return log.blocks.has(ref.hash as Hash);
+  }
+  const pk = publicKeyFromHex(ref.channel);
+  if (!pk) {
+    return false;
+  }
+  try {
+    await log.events.retrieveEvent(pk, ref.hash as Hash);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function readLocalReceptionMaxSeq(storageRoot: string | undefined): Promise<number> {
   if (storageRoot === undefined) {
     return 0;
@@ -357,16 +374,27 @@ export function attachPeerSession(
       return;
     }
     const objects: ObjectRef[] = [];
+    let skippedUnavailable = 0;
     for (const ref of refs) {
+      if (!(await receptionRefLocallyAvailable(log, ref))) {
+        skippedUnavailable += 1;
+        continue;
+      }
       const wireRef = await toWireRef(log, ref);
       if (wireRef !== null) {
         objects.push(wireRef);
       }
     }
+    if (skippedUnavailable > 0) {
+      syncDebugLine(
+        'wire',
+        `have filter skipped ${skippedUnavailable}/${refs.length} reception ref(s) not on disk`,
+      );
+    }
     if (objects.length === 0 && refs.length > 0) {
-      logSyncError(
-        'sendHave: reception refs could not be encoded (missing on disk?)',
-        new Error(`refs=${refs.length} more=${more}`),
+      syncDebugLine(
+        'wire',
+        `have → page had ${refs.length} journal ref(s) but none are locally available`,
       );
       if (more && nextCursor !== undefined) {
         send({ type: 'have', subject, objects: [], more: true, nextCursor });
