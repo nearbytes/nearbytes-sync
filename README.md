@@ -6,10 +6,13 @@ Normative requirements: `nearbytes-specs/requirements/sync-discovery-v1.md`, `sy
 
 ## Behavior (v0)
 
-- `hello` handshake with configured friends before anti-entropy
-- One active association per remote friend profile key
+- `hello` handshake with configured friends before anti-entropy (SYNC-08; no profile signature on wire)
+- One active association per remote `(profile, instance)` triple (SYNC-06)
+- **Local resume walk** on attach: outbound `delta` pages drive catch-up; only resume `have` (`fromCursor` set) advances pagination (SYNC-21, SYNC-10c)
+- Attach tail announce: unsolicited push `have` (no `fromCursor`) for last 256 journal entries (SYNC-21c)
+- Live reception pushes: reactive `have`/`want` — no timer-driven delta polling (SYNC-10)
 - LAN mDNS TXT `prof` = advertiser profile public key; only connects to configured friends
-- Blocks-first `want` ordering; event `have` includes `blockRefs` when available
+- Blocks-first `want` ordering (SYNC-12); event `have` includes `blockRefs` when available (SYNC-13)
 - Per-association serialized framed I/O (no interleaved writes)
 
 ## Build

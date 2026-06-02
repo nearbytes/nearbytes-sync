@@ -14,6 +14,7 @@ import { blockReadable } from './blockReadable.js';
 import {
   listLocalReceptionForConnect,
   listLocalReceptionPage,
+  readLocalReceptionMaxSeq,
 } from './receptionSync.js';
 import { buildResumeDelta, buildResumeSubscribe } from './sessionAttach.js';
 import { RECEPTION_RESUME_PAGE } from './syncConstants.js';
@@ -215,6 +216,11 @@ async function readLocalBytes(log: Log, ref: ObjectRef): Promise<Uint8Array | nu
   }
 }
 
+/** Opaque cursor key for in-flight resume pagination (empty string = journal start). */
+function resumeCursorKey(cursor: string | undefined): string {
+  return cursor !== undefined && cursor !== '' ? cursor : '';
+}
+
 async function hasObject(
   log: Log,
   ref: ObjectRef,
@@ -411,11 +417,31 @@ export function attachPeerSession(
 
   const missingRefsForWant = async (refs: readonly ObjectRef[]): Promise<ObjectRef[]> => {
     const missing: ObjectRef[] = [];
+    const channelEvents = new Map<string, Set<string>>();
     const batchSize = 32;
+
+    const refPresent = async (ref: ObjectRef): Promise<boolean> => {
+      if (ref.kind === 'block') {
+        return blockReadable(log, storageRoot, ref.hash as Hash);
+      }
+      const channel = ref.channel.toLowerCase();
+      let known = channelEvents.get(channel);
+      if (known === undefined) {
+        const pk = publicKeyFromHex(ref.channel);
+        if (pk === null) {
+          return false;
+        }
+        const hashes = await log.events.listEvents(pk);
+        known = new Set(hashes.map((h) => h.toLowerCase()));
+        channelEvents.set(channel, known);
+      }
+      return known.has(ref.hash.toLowerCase());
+    };
+
     for (let i = 0; i < refs.length; i += batchSize) {
       const batch = refs.slice(i, i + batchSize);
       const checked = await Promise.all(
-        batch.map(async (ref) => ((await hasObject(log, ref, storageRoot)) ? null : ref)),
+        batch.map(async (ref) => ((await refPresent(ref)) ? null : ref)),
       );
       for (const ref of checked) {
         if (ref !== null) {
@@ -445,12 +471,19 @@ export function attachPeerSession(
     more = false,
     nextCursor?: string,
     urgent = false,
+    fromCursor?: string,
   ): Promise<void> => {
     if (process.env.NBF_PROP_TRACE === '1') {
       console.error(`[nearbytes-sync] sendHave in n=${refs.length} urgent=${urgent}`);
     }
+    const fromCursorField =
+      fromCursor !== undefined && fromCursor !== ''
+        ? { fromCursor }
+        : fromCursor === ''
+          ? { fromCursor: '' as const }
+          : {};
     if (refs.length === 0 && !more) {
-      send({ type: 'have', subject, objects: [], more: false }, urgent);
+      send({ type: 'have', subject, objects: [], more: false, ...fromCursorField }, urgent);
       return;
     }
     const objects: ObjectRef[] = [];
@@ -499,7 +532,10 @@ export function attachPeerSession(
         `have → page had ${refs.length} journal ref(s) but none are locally available`,
       );
       if (more && nextCursor !== undefined) {
-        send({ type: 'have', subject, objects: [], more: true, nextCursor }, urgent);
+        send(
+          { type: 'have', subject, objects: [], more: true, nextCursor, ...fromCursorField },
+          urgent,
+        );
       }
       return;
     }
@@ -511,6 +547,7 @@ export function attachPeerSession(
         subject,
         objects,
         more,
+        ...fromCursorField,
         ...(effectiveNext !== undefined ? { nextCursor: effectiveNext } : {}),
       },
       urgent,
@@ -529,6 +566,9 @@ export function attachPeerSession(
     syncDebugLine('wire', `delta → global cursor=${cursor ?? 'start'}`);
     send(buildResumeDelta(subject, cursor), urgent);
   };
+
+  let timelineHaveInLogged = false;
+  let timelineWantOutLogged = false;
 
   const sendWants = (refs: readonly ObjectRef[]): void => {
     const { blocks, events } = partitionWantRefs(refs);
@@ -557,8 +597,6 @@ export function attachPeerSession(
   let lastFetchedCursor = options.initialFetchCursor;
   /** Page cursor to checkpoint only after outstanding `want`/`data` work finishes. */
   let pendingPageCursor: string | undefined;
-  /** One-shot rewind when a persisted cursor yields empty pages but we may still be behind. */
-  let emptyCatchupRewound = false;
 
   const flushPendingPageCursor = async (): Promise<void> => {
     if (pendingPageCursor === undefined) {
@@ -588,10 +626,131 @@ export function attachPeerSession(
       });
   };
 
-  let timelineHaveInLogged = false;
-  let timelineWantOutLogged = false;
+  /**
+   * Local resume walk (SYNC-19–SYNC-21): we send `delta` pages; inbound `have`
+   * answers only advance the walk when tagged with `fromCursor`. Unsolicited
+   * tail `have` (SYNC-21c) and live pushes (SYNC-10) may still drive `want`.
+   */
+  let resumeWalkInFlight: string | undefined;
+  let resumeWalkDone = false;
+  let resumeWalkRewound = false;
+  /** Dedupe attach `delta` + `subscribe` to one journal page per cursor. */
+  let lastResumeRespondedKey: string | undefined;
 
-  /** On attach: urgent resume from persisted cursor + announce our journal (SYNC-21c tail). */
+  const requestResumeWalkPage = (cursor: string | undefined): void => {
+    if (resumeWalkDone) {
+      return;
+    }
+    const key = resumeCursorKey(cursor);
+    if (resumeWalkInFlight === key) {
+      return;
+    }
+    resumeWalkInFlight = key;
+    const tl = options.timelineKey;
+    if (tl !== undefined) {
+      syncTimelineMark(tl, 'page→', `cursor=${cursor ?? 'start'}`);
+    }
+    requestGlobalDelta(cursor, true);
+  };
+
+  const finishResumeWalk = (): void => {
+    resumeWalkDone = true;
+    resumeWalkInFlight = undefined;
+    scheduleOrphanRepair();
+  };
+
+  const respondToGlobalResume = async (
+    cursor: string | undefined,
+    limit: number,
+  ): Promise<void> => {
+    const key = resumeCursorKey(cursor);
+    if (lastResumeRespondedKey === key) {
+      syncDebugLine('wire', `delta ← deduped cursor=${cursor ?? 'start'}`);
+      return;
+    }
+    lastResumeRespondedKey = key;
+    const out = await listLocalReceptionPage(log, storageRoot, cursor, limit);
+    await sendHave(out.refs, out.more, out.next, true, key);
+  };
+
+  const onResumeWalkHave = (msg: Extract<SyncMessage, { type: 'have' }>): void => {
+    if (msg.fromCursor === undefined) {
+      return;
+    }
+    const pageKey = resumeCursorKey(msg.fromCursor === '' ? undefined : msg.fromCursor);
+    if (resumeWalkInFlight !== undefined && pageKey !== resumeWalkInFlight) {
+      syncDebugLine(
+        'wire',
+        `have ← resume page cursor=${msg.fromCursor} ignored (inFlight=${resumeWalkInFlight})`,
+      );
+      return;
+    }
+    resumeWalkInFlight = undefined;
+
+    if (msg.objects.length === 0 && !msg.more) {
+      void (async () => {
+        if (msg.nextCursor !== undefined) {
+          await checkpointFetchCursor(msg.nextCursor);
+          lastFetchedCursor = msg.nextCursor;
+        }
+        const initial = options.initialFetchCursor;
+        const initialNum =
+          initial !== undefined && initial !== '' ? Number.parseInt(initial, 10) : Number.NaN;
+        const localMax = await readLocalReceptionMaxSeq(storageRoot);
+        if (!resumeWalkRewound && !Number.isNaN(initialNum) && initialNum > localMax) {
+          resumeWalkRewound = true;
+          syncDebugLine('wire', 'resume ← empty at stale cursor — paginate from start');
+          requestResumeWalkPage(undefined);
+          return;
+        }
+        finishResumeWalk();
+      })().catch((err) => logSyncError('resumeWalkEmpty', err));
+      return;
+    }
+
+    if (msg.nextCursor !== undefined) {
+      pendingPageCursor = msg.nextCursor;
+    }
+
+    if (!msg.more) {
+      finishResumeWalk();
+      return;
+    }
+
+    if (msg.nextCursor !== undefined) {
+      requestResumeWalkPage(msg.nextCursor);
+    }
+  };
+
+  const processHaveWants = async (msg: Extract<SyncMessage, { type: 'have' }>): Promise<void> => {
+    const candidates = await missingRefsForWant(msg.objects);
+    const wants: ObjectRef[] = [];
+    for (const ref of candidates) {
+      if (ref.kind === 'block') {
+        if (claimBlockWant(ref.hash)) {
+          wants.push(ref);
+        }
+      } else {
+        wants.push(ref);
+      }
+    }
+    if (wants.length > 0) {
+      if (msg.fromCursor !== undefined && msg.nextCursor !== undefined) {
+        pendingPageCursor = msg.nextCursor;
+      }
+      sendWants(wants);
+      return;
+    }
+    if (
+      msg.fromCursor !== undefined &&
+      msg.nextCursor !== undefined &&
+      pendingPageCursor === msg.nextCursor
+    ) {
+      await flushPendingPageCursor();
+    }
+  };
+
+  /** On attach: local resume walk + mutual subscribe/delta + tail announce (SYNC-15, SYNC-21c). */
   const runAttachSync = (): void => {
     const resumeCursor = options.initialFetchCursor;
     const tl = options.timelineKey;
@@ -599,6 +758,7 @@ export function attachPeerSession(
     if (tl !== undefined) {
       syncTimelineMark(tl, 'resume-sent', `cursor=${resumeCursor ?? 'start'}`);
     }
+    resumeWalkInFlight = resumeCursorKey(resumeCursor);
     send(buildResumeDelta(subject, resumeCursor), true);
     send(buildResumeSubscribe(subject, resumeCursor), true);
     void (async () => {
@@ -630,88 +790,35 @@ export function attachPeerSession(
     }
 
     if (msg.type === 'delta' && msg.mode === 'global') {
-      const out = await listLocalReceptionPage(
-        log,
-        storageRoot,
-        msg.cursor,
-        msg.limit ?? RECEPTION_RESUME_PAGE,
-      );
-      await sendHave(out.refs, out.more, out.next, true);
+      await respondToGlobalResume(msg.cursor, msg.limit ?? RECEPTION_RESUME_PAGE);
       return;
     }
 
     if (msg.type === 'subscribe' && msg.delta.mode === 'global') {
-      const out = await listLocalReceptionPage(
-        log,
-        storageRoot,
-        msg.delta.cursor,
-        msg.delta.limit ?? RECEPTION_RESUME_PAGE,
-      );
-      await sendHave(out.refs, out.more, out.next, true);
+      await respondToGlobalResume(msg.delta.cursor, msg.delta.limit ?? RECEPTION_RESUME_PAGE);
       return;
     }
 
     if (msg.type === 'have') {
       const tl = options.timelineKey;
+      const resumePage = msg.fromCursor !== undefined;
       if (tl !== undefined && !timelineHaveInLogged) {
         timelineHaveInLogged = true;
         syncTimelineMark(
           tl,
-          'have←',
-          `objects=${msg.objects.length} more=${msg.more}`,
+          resumePage ? 'have←' : 'have← push',
+          `objects=${msg.objects.length} more=${msg.more}` +
+            (resumePage ? ` from=${msg.fromCursor === '' ? 'start' : msg.fromCursor}` : ''),
         );
       }
       syncDebugLine(
         'wire',
         `have ← objects=${msg.objects.length} more=${msg.more}` +
-          (msg.nextCursor !== undefined ? ` next=${msg.nextCursor}` : ''),
+          (msg.nextCursor !== undefined ? ` next=${msg.nextCursor}` : '') +
+          (resumePage ? ` from=${msg.fromCursor === '' ? 'start' : msg.fromCursor}` : ' push'),
       );
-      const candidates = await missingRefsForWant(msg.objects);
-      const wants: ObjectRef[] = [];
-      for (const ref of candidates) {
-        if (ref.kind === 'block') {
-          if (claimBlockWant(ref.hash)) {
-            wants.push(ref);
-          }
-        } else {
-          wants.push(ref);
-        }
-      }
-      if (wants.length > 0) {
-        sendWants(wants);
-        if (msg.nextCursor !== undefined) {
-          pendingPageCursor = msg.nextCursor;
-        }
-        if (msg.more && msg.nextCursor) {
-          requestGlobalDelta(msg.nextCursor, true);
-        } else {
-          await flushPendingPageCursor();
-        }
-        return;
-      }
-      if (msg.more && msg.nextCursor) {
-        requestGlobalDelta(msg.nextCursor, true);
-      } else if (msg.objects.length === 0 && !msg.more) {
-        if (
-          !emptyCatchupRewound &&
-          lastFetchedCursor !== undefined &&
-          lastFetchedCursor !== ''
-        ) {
-          emptyCatchupRewound = true;
-          syncDebugLine('wire', 'have ← empty at cursor — restart from start');
-          requestGlobalDelta(undefined, true);
-        } else if (msg.nextCursor !== undefined) {
-          await checkpointFetchCursor(msg.nextCursor);
-          lastFetchedCursor = msg.nextCursor;
-        } else if (lastFetchedCursor !== undefined && lastFetchedCursor !== '') {
-          await checkpointFetchCursor(lastFetchedCursor);
-        }
-      } else {
-        if (msg.nextCursor !== undefined) {
-          await checkpointFetchCursor(msg.nextCursor);
-          lastFetchedCursor = msg.nextCursor;
-        }
-      }
+      onResumeWalkHave(msg);
+      await processHaveWants(msg);
       return;
     }
 
