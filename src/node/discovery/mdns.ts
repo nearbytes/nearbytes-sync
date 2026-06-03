@@ -164,7 +164,11 @@ export function createMdnsDiscovery(options: {
           protocol: LAN_DISCOVERY_SERVICE_PROTOCOL,
           port: entry.port,
           txt: txt as unknown as Record<string, string>,
-        });
+          // probe: false — name is unique by construction (peerId+profile derived
+          // from dataDir). A conflict means a stale record from our own previous
+          // crashed run; skip the probe to avoid mDNS being silently disabled.
+          probe: false,
+        } as Parameters<InstanceType<typeof Bonjour>['publish']>[0]);
       }
 
       browser = bonjour.find({
