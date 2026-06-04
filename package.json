@@ -36,6 +36,7 @@
     "build": "tsc",
     "type-check": "tsc --noEmit",
     "prepack": "tsc",
+    "refresh": "node scripts/refresh.mjs",
     "update": "node scripts/update.mjs",
     "daemon": "tsc && node ./bin/nbsync.mjs daemon",
     "install:systemd": "node ./scripts/install-systemd.mjs install",
@@ -49,8 +50,8 @@
     "bonjour-service": "^1.2.1",
     "chokidar": "^4.0.3",
     "hyperswarm": "^4.8.2",
-    "nearbytes-crypto": "github:nearbytes/nearbytes-crypto#6859719510764702844882b8488b35ab31f20145",
-    "nearbytes-log": "github:nearbytes/nearbytes-log#96d579f37b8c9d74d19a62f8019dd415e82b079e"
+    "nearbytes-crypto": "github:nearbytes/nearbytes-crypto",
+    "nearbytes-log": "github:nearbytes/nearbytes-log"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
