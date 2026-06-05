@@ -120,6 +120,7 @@ export function patchLogForReactiveHave(log: {
   log.reception.appendReception = async (ref) => {
     const cursor = await append(ref);
     pending.push(ref);
+    flushPending();
     return cursor;
   };
   const reception = log.reception as ReceptionWithFlush;
