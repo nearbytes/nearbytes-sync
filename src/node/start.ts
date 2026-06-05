@@ -645,15 +645,27 @@ export async function start(
     syncTimelineMarkSession('discovery-starting', `mode=${transport}`);
     if (transport === 'all') {
       const dhtStart = Date.now();
+      const mdnsStart = Date.now();
+      await Promise.all([
+        backends[0]!.start().then(() => {
+          syncTimelineMarkSession('dht-ready', `${Date.now() - dhtStart}ms`);
+        }),
+        backends[1]!.start().then(() => {
+          syncTimelineMarkSession('mdns-ready', `${Date.now() - mdnsStart}ms`);
+        }),
+      ]);
+    } else {
+      const mdnsStart = Date.now();
       await backends[0]!.start();
-      syncTimelineMarkSession('dht-ready', `${Date.now() - dhtStart}ms`);
+      syncTimelineMarkSession('mdns-ready', `${Date.now() - mdnsStart}ms`);
     }
-    const mdnsIdx = transport === 'all' ? 1 : 0;
-    const mdnsStart = Date.now();
-    await backends[mdnsIdx]!.start();
-    syncTimelineMarkSession('mdns-ready', `${Date.now() - mdnsStart}ms`);
     syncTimelineMarkSession('peer-search', 'waiting for remote');
   } catch (err) {
+    try {
+      await discovery.stop();
+    } catch (stopErr) {
+      process.stderr.write(`[nearbytes-sync] discovery.stop after start failure failed: ${String(stopErr)}\n`);
+    }
     releaseDataDirLock();
     throw err;
   }

@@ -6,6 +6,10 @@ import { logPeerSocketError } from '../../logSyncError.js';
 import { duplexFromTcpSocket } from '../netDuplex.js';
 import { dhtTransportLabel, waitForDhtTransportLabel } from './transportLabel.js';
 
+interface HyperswarmPeerDiscovery {
+  flushed(): Promise<void>;
+}
+
 /**
  * NOTE: socket `'error'` is intentionally NOT handled here — the
  * `Hyperswarm.on('connection')` listener in `createHyperswarmDiscovery`
@@ -126,9 +130,11 @@ export function createHyperswarmDiscovery(options: {
 
   return {
     async start(): Promise<void> {
+      const discoveries: HyperswarmPeerDiscovery[] = [];
       for (const topic of options.topics) {
-        await swarm.join(Buffer.from(topic), { client: true, server: true });
+        discoveries.push(swarm.join(Buffer.from(topic), { client: true, server: true }));
       }
+      await Promise.all(discoveries.map((discovery) => discovery.flushed()));
     },
     onPeer(handler): void {
       peerHandler = handler;
