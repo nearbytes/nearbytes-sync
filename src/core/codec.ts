@@ -8,11 +8,8 @@ export const FRAME_KIND_CONTROL = 0;
 export const FRAME_KIND_EVENT = 2;
 /** Block stream opener: hash + total, then `total` raw bytes on the wire (no per-chunk framing). */
 export const FRAME_KIND_BLOCK_STREAM_BEGIN = 3;
-/** Block chunk payload for transports that need multiplex-safe block delivery. */
-export const FRAME_KIND_BLOCK_CHUNK = 4;
 
 const STREAM_BEGIN_BODY_BYTES = 32 + 8;
-const BLOCK_CHUNK_HEADER_BYTES = 32 + 8 + 8 + 4;
 
 /** Pump slice when falling back to in-memory block bytes. */
 export const BLOCK_STREAM_WRITE_SLICE_BYTES = 4 * 1024 * 1024;
@@ -94,34 +91,11 @@ function encodeEventData(message: Extract<SyncMessage, { type: 'data' }>): Uint8
   return wrapLengthPrefixed(body);
 }
 
-function encodeBlockChunk(message: Extract<SyncMessage, { type: 'data' }>): Uint8Array {
-  if (message.object.kind !== 'block') {
-    throw new Error('encodeBlockChunk requires block object');
-  }
-  if (message.offset === undefined || message.total === undefined) {
-    throw new Error('block chunk requires offset and total');
-  }
-  const hashBytes = hexToBytes(message.object.hash);
-  if (hashBytes.length !== 32) {
-    throw new Error(`block hash must be 32 bytes, got ${hashBytes.length}`);
-  }
-  const payload = message.bytes;
-  const body = new Uint8Array(1 + BLOCK_CHUNK_HEADER_BYTES + payload.byteLength);
-  body[0] = FRAME_KIND_BLOCK_CHUNK;
-  body.set(hashBytes, 1);
-  const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
-  writeU64BE(view, 33, message.offset);
-  writeU64BE(view, 41, message.total);
-  writeU32BE(view, 49, payload.byteLength);
-  body.set(payload, 53);
-  return wrapLengthPrefixed(body);
-}
-
 /** Length-prefixed control / event frames only. Blocks use stream-begin + raw pump. */
 export function encodeFrame(message: SyncMessage): Uint8Array {
   if (message.type === 'data') {
     if (message.object.kind !== 'event') {
-      return encodeBlockChunk(message);
+      throw new Error('block data must use encodeBlockStreamBegin + raw write, not encodeFrame');
     }
     return encodeEventData(message);
   }
@@ -188,28 +162,6 @@ export function createWireDecoder(handlers: WireDecoderHandlers): WireDecoder {
     return { type: 'data', object: { kind: 'event', channel, hash }, bytes };
   };
 
-  const decodeBlockChunk = (body: Uint8Array): SyncMessage => {
-    if (body.length < 1 + BLOCK_CHUNK_HEADER_BYTES) {
-      throw new Error('block chunk frame too short');
-    }
-    const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
-    const hash = bytesToHex(body.subarray(1, 33));
-    const offset = readU64BE(view, 33);
-    const total = readU64BE(view, 41);
-    const payloadLen = readU32BE(view, 49);
-    const payloadStart = 53;
-    if (body.length < payloadStart + payloadLen) {
-      throw new Error('block chunk frame truncated');
-    }
-    return {
-      type: 'data',
-      object: { kind: 'block', hash },
-      bytes: body.subarray(payloadStart, payloadStart + payloadLen),
-      offset,
-      total,
-    };
-  };
-
   const parseFrames = (): void => {
     while (frameBuf.length >= 4) {
       const size = new DataView(frameBuf.buffer, frameBuf.byteOffset, frameBuf.byteLength).getUint32(
@@ -257,10 +209,6 @@ export function createWireDecoder(handlers: WireDecoderHandlers): WireDecoder {
       }
       if (kind === FRAME_KIND_EVENT) {
         handlers.onMessage(decodeEvent(body));
-        continue;
-      }
-      if (kind === FRAME_KIND_BLOCK_CHUNK) {
-        handlers.onMessage(decodeBlockChunk(body));
         continue;
       }
       if (kind === FRAME_KIND_CONTROL) {
