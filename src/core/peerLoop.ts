@@ -1,5 +1,5 @@
-import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { closeSync, existsSync, openSync, readSync } from 'node:fs';
+import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { Hash } from 'nearbytes-crypto';
@@ -281,7 +281,7 @@ async function pumpBlockStream(peer: DuplexPeer, bytes: Uint8Array): Promise<voi
 
 function sendBlockStream(
   log: Log,
-  runOutbound: (fn: () => void | Promise<void>) => void,
+  runOutbound: (fn: () => void | Promise<void>) => Promise<void>,
   peer: DuplexPeer,
   storageRoot: string | undefined,
   ref: Extract<ObjectRef, { kind: 'block' }>,
@@ -291,31 +291,39 @@ function sendBlockStream(
 ): void {
   const outboundCounter = outboundBlockStreamCounter(log);
   outboundCounter.begin();
-  runOutbound(async () => {
+  void (async () => {
     try {
       let pumped: { bytes: number; pumpBeginAt: number; pumpEndAt: number } | null = null;
+      const { isTcpDuplexPeer } = await import('../node/netDuplex.js');
+      const tcpPeer = isTcpDuplexPeer(peer);
       if (storageRoot) {
-        const { isTcpDuplexPeer } = await import('../node/netDuplex.js');
-        if (isTcpDuplexPeer(peer)) {
+        if (tcpPeer) {
           const { pumpBlockFileOverSocket } = await import('../node/tcpBulk.js');
-          pumped = await pumpBlockFileOverSocket(peer.tcpSocket, storageRoot, ref.hash);
+          await runOutbound(async () => {
+            pumped = await pumpBlockFileOverSocket(peer.tcpSocket, storageRoot, ref.hash);
+          });
         } else {
-          const { pumpBlockFileFromStorage } = await import('../node/blockPump.js');
-          pumped = await pumpBlockFileFromStorage(storageRoot, ref.hash, peer);
+          pumped = await pumpBlockFileFromStorageAsFrames(storageRoot, ref, runOutbound, peer);
         }
       } else {
         if (!bytes) {
           throw new Error('sendBlockStream requires bytes when blockStorageRoot is unset');
         }
-        const pumpBeginAt = Date.now();
-        const begin = encodeBlockStreamBegin(ref.hash, totalBytes);
-        if (peer.writeAsync) {
-          await peer.writeAsync(begin);
+        if (tcpPeer) {
+          await runOutbound(async () => {
+            const pumpBeginAt = Date.now();
+            const begin = encodeBlockStreamBegin(ref.hash, totalBytes);
+            if (peer.writeAsync) {
+              await peer.writeAsync(begin);
+            } else {
+              peer.write(begin);
+            }
+            await pumpBlockStream(peer, bytes);
+            pumped = { bytes: totalBytes, pumpBeginAt, pumpEndAt: Date.now() };
+          });
         } else {
-          peer.write(begin);
+          pumped = await pumpBlockBytesAsFrames(ref, bytes, runOutbound, peer, totalBytes);
         }
-        await pumpBlockStream(peer, bytes);
-        pumped = { bytes: totalBytes, pumpBeginAt, pumpEndAt: Date.now() };
       }
       if (pumped) {
         await appendBenchMarker(log, 'bulk-send-phases', {
@@ -334,7 +342,65 @@ function sendBlockStream(
     } finally {
       outboundCounter.end();
     }
+  })();
+}
+
+async function writeBlockChunkFrame(
+  runOutbound: (fn: () => void | Promise<void>) => Promise<void>,
+  peer: DuplexPeer,
+  ref: Extract<ObjectRef, { kind: 'block' }>,
+  bytes: Uint8Array,
+  offset: number,
+  total: number,
+): Promise<void> {
+  const frame = encodeFrame({ type: 'data', object: ref, bytes, offset, total });
+  await runOutbound(async () => {
+    if (peer.writeAsync) {
+      await peer.writeAsync(frame);
+    } else {
+      peer.write(frame);
+    }
   });
+}
+
+async function pumpBlockBytesAsFrames(
+  ref: Extract<ObjectRef, { kind: 'block' }>,
+  bytes: Uint8Array,
+  runOutbound: (fn: () => void | Promise<void>) => Promise<void>,
+  peer: DuplexPeer,
+  total: number,
+): Promise<{ bytes: number; pumpBeginAt: number; pumpEndAt: number }> {
+  const pumpBeginAt = Date.now();
+  for (let offset = 0; offset < total; offset += BLOCK_STREAM_WRITE_SLICE_BYTES) {
+    const chunk = bytes.subarray(offset, Math.min(offset + BLOCK_STREAM_WRITE_SLICE_BYTES, total));
+    await writeBlockChunkFrame(runOutbound, peer, ref, chunk, offset, total);
+  }
+  return { bytes: total, pumpBeginAt, pumpEndAt: Date.now() };
+}
+
+async function pumpBlockFileFromStorageAsFrames(
+  dataDir: string,
+  ref: Extract<ObjectRef, { kind: 'block' }>,
+  runOutbound: (fn: () => void | Promise<void>) => Promise<void>,
+  peer: DuplexPeer,
+): Promise<{ bytes: number; pumpBeginAt: number; pumpEndAt: number }> {
+  const abs = join(dataDir, blockPath(ref.hash as Hash));
+  const size = (await stat(abs)).size;
+  const fd = openSync(abs, 'r');
+  const buf = Buffer.allocUnsafe(BLOCK_STREAM_WRITE_SLICE_BYTES);
+  const pumpBeginAt = Date.now();
+  try {
+    let sent = 0;
+    while (sent < size) {
+      const need = Math.min(BLOCK_STREAM_WRITE_SLICE_BYTES, size - sent);
+      const read = readSync(fd, buf, 0, need, sent);
+      await writeBlockChunkFrame(runOutbound, peer, ref, buf.subarray(0, read), sent, size);
+      sent += read;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return { bytes: size, pumpBeginAt, pumpEndAt: Date.now() };
 }
 
 /** SYNC-12: blocks before events in separate want messages. */
@@ -383,14 +449,16 @@ export function attachPeerSession(
         logSyncError('peerLoop inbound', err);
       });
   };
-  const runOutbound = (fn: () => void | Promise<void>): void => {
-    outboundWire = outboundWire
+  const runOutbound = (fn: () => void | Promise<void>): Promise<void> => {
+    const task = outboundWire
       .then(async () => {
         await fn();
       })
       .catch((err) => {
         logSyncError('peerLoop outbound', err);
       });
+    outboundWire = task;
+    return task;
   };
 
   const send = (message: SyncMessage, urgent = false): void => {
@@ -865,6 +933,7 @@ export function attachPeerSession(
 
     if (msg.type === 'data') {
       if (msg.object.kind === 'block') {
+        await onBlockChunk(msg);
         return;
       }
       const result = await acceptData(log, msg.object, msg.bytes);
@@ -977,6 +1046,135 @@ export function attachPeerSession(
     });
     sessionEvents.blockReceived(hash, bytes);
     scheduleOrphanRepair();
+  };
+
+  type ChunkedIncomingBlock =
+    | {
+        readonly mode: 'disk';
+        readonly hash: string;
+        readonly total: number;
+        readonly sink: DiskBlockStreamSink;
+      }
+    | {
+        readonly mode: 'memory';
+        readonly hash: string;
+        readonly total: number;
+        readonly buffer: Uint8Array;
+        readonly hasher: ReturnType<typeof createHash>;
+        received: number;
+      }
+    | {
+        readonly mode: 'discard';
+        readonly hash: string;
+        readonly total: number;
+        received: number;
+      };
+  const chunkedIncoming = new Map<string, ChunkedIncomingBlock>();
+
+  const onBlockChunk = async (
+    msg: Extract<SyncMessage, { type: 'data' }>,
+  ): Promise<void> => {
+    if (msg.object.kind !== 'block') {
+      return;
+    }
+    const hash = msg.object.hash.toLowerCase();
+    const total = msg.total;
+    const offset = msg.offset;
+    if (total === undefined || offset === undefined) {
+      logSyncError(`block chunk missing offset:${hash.slice(0, 16)}`, new Error('missing offset/total'));
+      return;
+    }
+    let stream = chunkedIncoming.get(hash);
+    if (stream === undefined) {
+      if (offset !== 0) {
+        logSyncError(`block chunk out of order ${hash.slice(0, 16)}`, new Error(`offset ${offset}`));
+        return;
+      }
+      if (storageRoot && existsSync(join(storageRoot, blockPath(hash as Hash)))) {
+        stream = { mode: 'discard', hash, total, received: 0 };
+      } else if (storageRoot && diskBlockStream) {
+        stream = { mode: 'disk', hash, total, sink: diskBlockStream.create(hash, total) };
+      } else {
+        if (total > MAX_BLOCK_STREAM_BUFFER_BYTES) {
+          throw new Error(`block chunk stream ${total} B exceeds in-memory limit ${MAX_BLOCK_STREAM_BUFFER_BYTES}`);
+        }
+        stream = {
+          mode: 'memory',
+          hash,
+          total,
+          buffer: new Uint8Array(total),
+          hasher: createHash('sha256'),
+          received: 0,
+        };
+      }
+      chunkedIncoming.set(hash, stream);
+      await appendBenchMarker(log, 'block-stream-begin', {
+        hash: hash.slice(0, 16),
+        bytes: total,
+        framed: true,
+      }).catch(() => undefined);
+    }
+    const received = stream.mode === 'disk' ? stream.sink.received : stream.received;
+    if (offset !== received) {
+      logSyncError(
+        `block chunk out of order ${hash.slice(0, 16)}`,
+        new Error(`expected ${received} got ${offset}`),
+      );
+      return;
+    }
+    if (stream.mode === 'disk') {
+      stream.sink.ingest(msg.bytes);
+      if (stream.sink.received >= stream.sink.total) {
+        chunkedIncoming.delete(hash);
+        releaseBlockClaim(hash);
+        const result = await stream.sink.finish();
+        if (result.outcome === 'invalid') {
+          logSyncError(`block stream hash mismatch ${hash.slice(0, 16)}`, new Error('disk block stream verify failed'));
+          return;
+        }
+        await markBlockStored(hash, stream.total);
+        const phases = result.phases;
+        await appendBenchMarker(log, 'bulk-recv-phases', {
+          hash: hash.slice(0, 16),
+          bytes: stream.total,
+          ...(phases.firstByteAt !== null ? { firstByteAt: phases.firstByteAt } : {}),
+          ...(phases.lastByteAt !== null ? { lastByteAt: phases.lastByteAt } : {}),
+          ...(phases.diskDrainDoneAt !== null ? { diskDrainDoneAt: phases.diskDrainDoneAt } : {}),
+          hashDoneAt: phases.hashDoneAt,
+          renameDoneAt: phases.renameDoneAt,
+          framed: true,
+        }).catch((err) => logSyncError('bulk-recv-phases', err));
+        await appendBenchMarker(log, 'block-stream-end', {
+          hash: hash.slice(0, 16),
+          bytes: stream.total,
+          framed: true,
+        }).catch(() => undefined);
+      }
+      return;
+    }
+    if (stream.mode === 'discard') {
+      stream.received = Math.min(stream.total, stream.received + msg.bytes.byteLength);
+      if (stream.received >= stream.total) {
+        chunkedIncoming.delete(hash);
+        releaseBlockClaim(hash);
+      }
+      return;
+    }
+    const take = Math.min(msg.bytes.byteLength, stream.total - stream.received);
+    const slice = msg.bytes.subarray(0, take);
+    stream.buffer.set(slice, stream.received);
+    stream.hasher.update(slice);
+    stream.received += take;
+    if (stream.received >= stream.total) {
+      chunkedIncoming.delete(hash);
+      releaseBlockClaim(hash);
+      const digest = stream.hasher.digest('hex');
+      if (digest !== hash) {
+        logSyncError(`block stream hash mismatch ${hash.slice(0, 16)}`, new Error('memory block stream verify failed'));
+        return;
+      }
+      await onBlockStream(hash, stream.buffer);
+    }
   };
 
   const finishIncomingStream = async (): Promise<void> => {
