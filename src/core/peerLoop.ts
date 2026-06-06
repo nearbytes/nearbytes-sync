@@ -290,7 +290,6 @@ function sendBlockStream(
   sessionEvents: PeerSessionEventEmitter,
 ): void {
   const outboundCounter = outboundBlockStreamCounter(log);
-  const frameChunks = outboundCounter.size() > 0;
   outboundCounter.begin();
   void (async () => {
     try {
@@ -303,19 +302,14 @@ function sendBlockStream(
           await runOutbound(async () => {
             pumped = await pumpBlockFileOverSocket(peer.tcpSocket, storageRoot, ref.hash);
           });
-        } else if (frameChunks) {
-          pumped = await pumpBlockFileFromStorageAsFrames(storageRoot, ref, runOutbound, peer);
         } else {
-          const { pumpBlockFileFromStorage } = await import('../node/blockPump.js');
-          await runOutbound(async () => {
-            pumped = await pumpBlockFileFromStorage(storageRoot, ref.hash, peer);
-          });
+          pumped = await pumpBlockFileFromStorageAsFrames(storageRoot, ref, runOutbound, peer);
         }
       } else {
         if (!bytes) {
           throw new Error('sendBlockStream requires bytes when blockStorageRoot is unset');
         }
-        if (tcpPeer || !frameChunks) {
+        if (tcpPeer) {
           await runOutbound(async () => {
             const pumpBeginAt = Date.now();
             const begin = encodeBlockStreamBegin(ref.hash, totalBytes);
