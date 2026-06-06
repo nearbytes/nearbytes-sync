@@ -69,10 +69,12 @@ function duplexFromSocket(socket: {
       onDrain = () => done();
       onError = (err) => done(err instanceof Error ? err : new Error(String(err)));
       socket.once?.('error', onError);
-      const flushed = socket.write(chunk, done);
+      const flushed = socket.write(chunk);
       if (flushed === false) {
         socket.once?.('drain', onDrain);
+        return;
       }
+      queueMicrotask(() => done());
     });
   return {
     write: (chunk) => socket.write(chunk),
