@@ -14,6 +14,7 @@ declare module 'hyperswarm' {
 
   export default class Hyperswarm extends EventEmitter {
     join(topic: Buffer, options?: { client?: boolean; server?: boolean }): PeerDiscovery;
+    flush(): Promise<void>;
     destroy(): Promise<void>;
     on(event: 'connection', listener: (socket: Duplex, peerInfo: PeerInfo) => void): this;
   }

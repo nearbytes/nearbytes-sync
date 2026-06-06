@@ -10,6 +10,25 @@ interface HyperswarmPeerDiscovery {
   flushed(): Promise<void>;
 }
 
+interface HyperswarmInstance {
+  join(topic: Buffer, options?: { client?: boolean; server?: boolean }): HyperswarmPeerDiscovery;
+  flush(): Promise<void>;
+  destroy(): Promise<void>;
+  on(
+    event: 'connection',
+    listener: (
+      socket: {
+        on(event: string, cb: (...args: unknown[]) => void): void;
+        once?(event: string, cb: (...args: unknown[]) => void): void;
+        off?(event: string, cb: (...args: unknown[]) => void): void;
+        write(chunk: Uint8Array, cb?: (err?: Error | null) => void): boolean | void;
+        end(): void;
+      },
+      peerInfo: { publicKey: Buffer; topics?: readonly Buffer[]; client?: boolean },
+    ) => void,
+  ): HyperswarmInstance;
+}
+
 /**
  * NOTE: socket `'error'` is intentionally NOT handled here — the
  * `Hyperswarm.on('connection')` listener in `createHyperswarmDiscovery`
@@ -108,7 +127,7 @@ export function createHyperswarmDiscovery(options: {
   readonly topicToAssociationProfile: ReadonlyMap<string, string>;
   readonly fallbackAssociationProfile: string;
 }): PeerDiscovery {
-  const swarm = new Hyperswarm();
+  const swarm: HyperswarmInstance = new Hyperswarm();
   let peerHandler: ((peer: DiscoveredPeer) => void) | null = null;
 
   const pickAssociationProfile = (peerTopics: readonly Buffer[] | undefined): string => {
@@ -170,6 +189,7 @@ export function createHyperswarmDiscovery(options: {
         discoveries.push(swarm.join(Buffer.from(topic), { client: true, server: true }));
       }
       await Promise.all(discoveries.map((discovery) => discovery.flushed()));
+      await swarm.flush();
     },
     onPeer(handler): void {
       peerHandler = handler;
