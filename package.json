@@ -51,7 +51,7 @@
     "chokidar": "^4.0.3",
     "hyperswarm": "^4.8.2",
     "nearbytes-crypto": "github:nearbytes/nearbytes-crypto",
-    "nearbytes-log": "github:nearbytes/nearbytes-log"
+    "nearbytes-log": "https://github.com/nearbytes/nearbytes-log.git#commit=0a1bef159ead34b542d20af74b8473e2232a90e2"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
