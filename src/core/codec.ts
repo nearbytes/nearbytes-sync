@@ -12,7 +12,7 @@ export const FRAME_KIND_BLOCK_STREAM_BEGIN = 3;
 const STREAM_BEGIN_BODY_BYTES = 32 + 8;
 
 /** Pump slice when falling back to in-memory block bytes. */
-export const BLOCK_STREAM_WRITE_SLICE_BYTES = 16 * 1024 * 1024;
+export const BLOCK_STREAM_WRITE_SLICE_BYTES = 4 * 1024 * 1024;
 
 function readU32BE(view: DataView, offset: number): number {
   return view.getUint32(offset, false);
