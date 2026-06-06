@@ -21,7 +21,9 @@ interface HyperswarmPeerDiscovery {
  */
 function duplexFromSocket(socket: {
   on(event: string, cb: (...args: unknown[]) => void): void;
-  write(chunk: Uint8Array): void;
+  once?(event: string, cb: (...args: unknown[]) => void): void;
+  off?(event: string, cb: (...args: unknown[]) => void): void;
+  write(chunk: Uint8Array, cb?: (err?: Error | null) => void): boolean | void;
   end(): void;
 }): DuplexPeer {
   if (socket instanceof Socket) {
@@ -48,8 +50,33 @@ function duplexFromSocket(socket: {
   });
   socket.on('close', emitClose);
   socket.on('error', emitClose);
+  const writeAsync = (chunk: Uint8Array): Promise<void> =>
+    new Promise((resolve, reject) => {
+      let settled = false;
+      let onDrain: (() => void) | undefined;
+      let onError: ((err: unknown) => void) | undefined;
+      const cleanup = (): void => {
+        if (onDrain) socket.off?.('drain', onDrain);
+        if (onError) socket.off?.('error', onError);
+      };
+      const done = (err?: Error | null): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (err) reject(err);
+        else resolve();
+      };
+      onDrain = () => done();
+      onError = (err) => done(err instanceof Error ? err : new Error(String(err)));
+      socket.once?.('error', onError);
+      const flushed = socket.write(chunk, done);
+      if (flushed === false) {
+        socket.once?.('drain', onDrain);
+      }
+    });
   return {
     write: (chunk) => socket.write(chunk),
+    writeAsync,
     onData: (cb) => {
       handlers.add(cb);
       return () => handlers.delete(cb);
@@ -98,7 +125,13 @@ export function createHyperswarmDiscovery(options: {
   swarm.on(
     'connection',
     (
-      socket: { on(event: string, cb: (...args: unknown[]) => void): void; write(chunk: Uint8Array): void; end(): void },
+      socket: {
+        on(event: string, cb: (...args: unknown[]) => void): void;
+        once?(event: string, cb: (...args: unknown[]) => void): void;
+        off?(event: string, cb: (...args: unknown[]) => void): void;
+        write(chunk: Uint8Array, cb?: (err?: Error | null) => void): boolean | void;
+        end(): void;
+      },
       peerInfo: { publicKey: Buffer; topics?: readonly Buffer[]; client?: boolean },
     ) => {
       if (!peerHandler) {
