@@ -889,6 +889,8 @@ export function attachPeerSession(
           msg.object.hash,
           msg.bytes.byteLength,
         );
+      }
+      if (result === 'stored' || result === 'duplicate') {
         const deps = await missingInboundEventDependencies(
           log,
           msg.object.channel,
