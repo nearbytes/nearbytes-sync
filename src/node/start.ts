@@ -1,7 +1,7 @@
 import type { Log } from 'nearbytes-log';
 import { profileSubject, syncTopic } from '../core/topic.js';
 import { createCompositeDiscovery } from '../discovery/composite.js';
-import type { DiscoveredPeer } from '../discovery/types.js';
+import type { DiscoveredPeer, PeerDiscovery } from '../discovery/types.js';
 import { connectDiscoveredPeer } from './connect.js';
 import { createHyperswarmDiscovery } from './discovery/hyperswarm.js';
 import { createMdnsDiscovery } from './discovery/mdns.js';
@@ -48,9 +48,14 @@ export interface StartOptions {
   readonly activeProfilePublicKey?: string;
   /** Log data directory (`…/data`) for fs block streaming (Node). */
   readonly blockStorageRoot?: string;
-  /** `mdns` = LAN TCP only (max throughput on localhost). Default `all` (mDNS + Hyperswarm). */
-  readonly discoveryTransport?: 'mdns' | 'all';
+  /**
+   * Discovery transport selection.
+   * `mdns` = LAN TCP only, `dht`/`hyperswarm` = Hyperswarm only, `all` = both.
+   */
+  readonly discoveryTransport?: DiscoveryTransport;
 }
+
+export type DiscoveryTransport = 'mdns' | 'dht' | 'hyperswarm' | 'all';
 
 export interface SyncSnapshot {
   /** Block hashes for which a `want` is outstanding (incoming streams not yet finished). */
@@ -183,6 +188,16 @@ function normalizeKeySet(keys: readonly string[]): Set<string> {
   return set;
 }
 
+function normalizeDiscoveryTransport(raw: string | undefined): DiscoveryTransport {
+  const value = raw ?? 'all';
+  if (value === 'mdns' || value === 'dht' || value === 'hyperswarm' || value === 'all') {
+    return value;
+  }
+  throw new Error(
+    `unsupported discovery transport "${value}" (expected mdns, dht, hyperswarm, or all)`,
+  );
+}
+
 /**
  * Read the persisted per-`dataDir` instance identity *without* creating one
  * if missing. Returns the empty string if the file does not exist, is
@@ -285,30 +300,35 @@ export async function start(
   const fetchCursors = createFetchCursorStore(options.blockStorageRoot);
   const authorizedRemoteProfiles = new Set<string>([...servedSet, ...friendSet]);
   // Default to mDNS+Hyperswarm so peers find each other across both LAN and
-  // WAN out of the box. Benchmarks that want LAN-only TCP for max throughput
-  // (no Noise encryption, no UDX framing) explicitly opt out by setting
-  // NEARBYTES_SYNC_DISCOVERY=mdns or passing `discoveryTransport: 'mdns'`.
-  const transport =
-    options.discoveryTransport ??
-    process.env['NEARBYTES_SYNC_DISCOVERY'] ??
-    'all';
-  const backends = [
-    createMdnsDiscovery({
-      peerId,
-      instancePublicKey,
-      localProfilePublicKeys: [...servedSet],
-      activeProfilePublicKey: activeProfile,
-      friendProfileKeys: friendSet,
-    }),
-  ];
-  if (transport === 'all') {
-    backends.unshift(
-      createHyperswarmDiscovery({
+  // WAN out of the box. Benchmarks and operators can select a single backend
+  // with NEARBYTES_SYNC_DISCOVERY=mdns or dht/hyperswarm.
+  const transport = normalizeDiscoveryTransport(
+    options.discoveryTransport ?? process.env['NEARBYTES_SYNC_DISCOVERY'],
+  );
+  const backends: PeerDiscovery[] = [];
+  const useDht = transport === 'all' || transport === 'dht' || transport === 'hyperswarm';
+  const useMdns = transport === 'all' || transport === 'mdns';
+  const dhtBackend = useDht
+    ? createHyperswarmDiscovery({
         topics,
         topicToAssociationProfile,
         fallbackAssociationProfile: activeProfile,
-      }),
-    );
+      })
+    : null;
+  const mdnsBackend = useMdns
+    ? createMdnsDiscovery({
+        peerId,
+        instancePublicKey,
+        localProfilePublicKeys: [...servedSet],
+        activeProfilePublicKey: activeProfile,
+        friendProfileKeys: friendSet,
+      })
+    : null;
+  if (dhtBackend) {
+    backends.push(dhtBackend);
+  }
+  if (mdnsBackend) {
+    backends.push(mdnsBackend);
   }
   const discovery = createCompositeDiscovery(backends);
 
@@ -643,21 +663,25 @@ export async function start(
 
   try {
     syncTimelineMarkSession('discovery-starting', `mode=${transport}`);
-    if (transport === 'all') {
+    if (useDht && useMdns) {
       const dhtStart = Date.now();
       const mdnsStart = Date.now();
       await Promise.all([
-        backends[0]!.start().then(() => {
+        dhtBackend!.start().then(() => {
           syncTimelineMarkSession('dht-ready', `${Date.now() - dhtStart}ms`);
         }),
-        backends[1]!.start().then(() => {
+        mdnsBackend!.start().then(() => {
           syncTimelineMarkSession('mdns-ready', `${Date.now() - mdnsStart}ms`);
         }),
       ]);
-    } else {
+    } else if (useMdns) {
       const mdnsStart = Date.now();
-      await backends[0]!.start();
+      await mdnsBackend!.start();
       syncTimelineMarkSession('mdns-ready', `${Date.now() - mdnsStart}ms`);
+    } else {
+      const dhtStart = Date.now();
+      await dhtBackend!.start();
+      syncTimelineMarkSession('dht-ready', `${Date.now() - dhtStart}ms`);
     }
     syncTimelineMarkSession('peer-search', 'waiting for remote');
   } catch (err) {

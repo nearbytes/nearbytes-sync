@@ -39,7 +39,7 @@ import {
   type Log,
   type ReceptionObjectRef,
 } from 'nearbytes-log';
-import { start, type SyncHandle } from './start.js';
+import { start, type DiscoveryTransport, type SyncHandle } from './start.js';
 import {
   configsEquivalent,
   readDaemonConfig,
@@ -116,8 +116,9 @@ async function startSyncFromConfig(log: Log, config: SyncDaemonConfig): Promise<
   if (activeIdx < 0) {
     throw new Error(`activeProfile "${config.activeProfile}" not in profiles[]`);
   }
-  const discoveryTransport =
-    process.env['NEARBYTES_SYNC_DISCOVERY'] === 'mdns' ? ('mdns' as const) : undefined;
+  const discoveryTransport = process.env['NEARBYTES_SYNC_DISCOVERY'] as
+    | DiscoveryTransport
+    | undefined;
   return start(log, config.friends, {
     serveProfilePublicKeys: servedPks,
     activeProfilePublicKey: servedPks[activeIdx]!,
