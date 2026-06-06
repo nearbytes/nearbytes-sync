@@ -397,10 +397,6 @@ export function attachPeerSession(
     const write = (): void => {
       peer.write(encodeFrame(message));
     };
-    if (urgent) {
-      write();
-      return;
-    }
     runOutbound(write);
   };
 
