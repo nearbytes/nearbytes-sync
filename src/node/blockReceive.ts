@@ -173,22 +173,17 @@ function createAsyncSink(dataDir: string, hash: string, total: number): DiskBloc
     const chunkLen = chunk.byteLength;
     const remaining = total - received;
     const usable = remaining < chunkLen ? remaining : chunkLen;
-    const space = BATCH_BYTES - batchUsed;
-    if (usable <= space) {
-      batchBuf.set(usable === chunkLen ? chunk : chunk.subarray(0, usable), batchUsed);
-      batchUsed += usable;
-      received += usable;
+    let offset = 0;
+    while (offset < usable) {
+      const space = BATCH_BYTES - batchUsed;
+      const take = Math.min(space, usable - offset);
+      batchBuf.set(chunk.subarray(offset, offset + take), batchUsed);
+      batchUsed += take;
+      received += take;
+      offset += take;
       if (batchUsed === BATCH_BYTES) {
         flushBatch();
       }
-    } else {
-      batchBuf.set(chunk.subarray(0, space), batchUsed);
-      batchUsed += space;
-      flushBatch();
-      const tail = usable - space;
-      batchBuf.set(chunk.subarray(space, space + tail), 0);
-      batchUsed += tail;
-      received += usable;
     }
     if (received >= total) {
       lastByteAt = Date.now();
