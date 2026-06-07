@@ -25,6 +25,9 @@ export const STALL_OUTBOUND_PUMP_MS = 300_000;
 /** Quiescent session rotation age. SYNC-65 reference. */
 export const SESSION_ROTATION_MAX_AGE_MS = 600_000;
 
+/** Poll interval once max age is reached but the session is still busy. */
+export const SESSION_ROTATION_POLL_MS = 30_000;
+
 export type StallReason =
   | 'want-timeout'
   | 'stream-timeout'
@@ -181,13 +184,18 @@ export class SessionStallGuard {
   }
 
   private armRotation(): void {
+    const ageMs = Date.now() - this.connectedAt;
+    const delayMs =
+      ageMs >= SESSION_ROTATION_MAX_AGE_MS
+        ? SESSION_ROTATION_POLL_MS
+        : Math.max(0, SESSION_ROTATION_MAX_AGE_MS - ageMs);
     const timer = setTimeout(() => {
       if (isSessionQuiescent(this.quiescence())) {
         this.stall('session-rotation');
-      } else {
-        this.armRotation();
+        return;
       }
-    }, Math.max(0, SESSION_ROTATION_MAX_AGE_MS - (Date.now() - this.connectedAt)));
+      this.armRotation();
+    }, delayMs);
     unrefTimer(timer);
     this.rotationTimer = timer;
   }

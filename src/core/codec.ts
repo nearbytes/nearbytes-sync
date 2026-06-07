@@ -115,10 +115,18 @@ export interface WireDecoderHandlers {
 /**
  * Control frames are length-prefixed; block bodies are a continuous `total`-byte run (SYNC-33).
  */
+/** Partial block-stream byte accounting in the wire decoder (SYNC-33). */
+export interface BlockStreamParseState {
+  readonly total: number;
+  readonly received: number;
+}
+
 export interface WireDecoder {
   (chunk: Uint8Array): void;
   /** Reset block-stream parser state after the receiver has consumed `total` bytes. */
   endBlockStream(): void;
+  /** Non-null while the decoder is consuming a continuous block-stream body. */
+  blockStreamState(): BlockStreamParseState | null;
 }
 
 export function createWireDecoder(handlers: WireDecoderHandlers): WireDecoder {
@@ -240,6 +248,13 @@ export function createWireDecoder(handlers: WireDecoderHandlers): WireDecoder {
     streamReceived = 0;
   };
 
+  const blockStreamState = (): BlockStreamParseState | null => {
+    if (streamTotal <= 0 || streamReceived >= streamTotal) {
+      return null;
+    }
+    return { total: streamTotal, received: streamReceived };
+  };
+
   const decode = (chunk: Uint8Array): void => {
     if (streamTotal > 0 && streamReceived < streamTotal) {
       feedStream(chunk);
@@ -249,7 +264,7 @@ export function createWireDecoder(handlers: WireDecoderHandlers): WireDecoder {
     parseFrames();
   };
 
-  return Object.assign(decode, { endBlockStream });
+  return Object.assign(decode, { endBlockStream, blockStreamState });
 }
 
 /** Handshake and other control-only paths (buffers complete block in memory). */

@@ -413,6 +413,7 @@ export function attachPeerSession(
 
   let resumeWalkInFlight: string | undefined;
   let incomingStreamActive = false;
+  let finishingIncoming = false;
 
   /**
    * Per-Log inflight block tracker (SYNC: at-most-one `want(H)` across sessions).
@@ -426,18 +427,6 @@ export function attachPeerSession(
   const claimedHashes = new Set<string>();
 
   let stallGuard: SessionStallGuard | null = null;
-  if (options.onSessionStall !== undefined) {
-    stallGuard = new SessionStallGuard(
-      options.onSessionStall,
-      () => ({
-        wantsPending: claimedHashes.size,
-        streamActive: incomingStreamActive,
-        outboundActive: stallGuard?.isOutboundActive() ?? false,
-        resumeInFlight: resumeWalkInFlight !== undefined,
-      }),
-      options.sessionConnectedAt ?? Date.now(),
-    );
-  }
 
   const missingRefsForWant = async (refs: readonly ObjectRef[]): Promise<ObjectRef[]> => {
     const missing: ObjectRef[] = [];
@@ -790,9 +779,7 @@ export function attachPeerSession(
     if (tl !== undefined) {
       syncTimelineMark(tl, 'resume-sent', `cursor=${resumeCursor ?? 'start'}`);
     }
-    resumeWalkInFlight = resumeCursorKey(resumeCursor);
-    stallGuard?.armResume();
-    send(buildResumeDelta(subject, resumeCursor), true);
+    requestResumeWalkPage(resumeCursor);
     send(buildResumeSubscribe(subject, resumeCursor), true);
     void (async () => {
       const out = await listLocalReceptionForConnect(log, storageRoot);
@@ -1027,70 +1014,80 @@ export function attachPeerSession(
   };
 
   const finishIncomingStream = async (): Promise<void> => {
+    if (finishingIncoming) {
+      return;
+    }
     const stream = incoming;
     if (!stream) {
       return;
     }
+    finishingIncoming = true;
     incoming = null;
     incomingStreamActive = false;
     stallGuard?.clearStream();
     clearBulkInbound();
     releaseBlockClaim(stream.hash);
-    if (stream.mode === 'discard') {
-      return;
-    }
-    if (stream.mode === 'disk') {
-      const result = await stream.sink.finish();
-      if (result.outcome === 'invalid') {
+    try {
+      if (stream.mode === 'discard') {
+        return;
+      }
+      if (stream.mode === 'disk') {
+        const result = await stream.sink.finish();
+        if (result.outcome === 'invalid') {
+          logSyncError(
+            `block stream hash mismatch ${stream.hash.slice(0, 16)}`,
+            new Error('disk block stream verify failed'),
+          );
+          return;
+        }
+        await markBlockStored(stream.hash, stream.total);
+        const phases = result.phases;
+        const fields: Record<string, string | number | boolean> = {
+          hash: stream.hash.slice(0, 16),
+          bytes: stream.total,
+          hashDoneAt: phases.hashDoneAt,
+          renameDoneAt: phases.renameDoneAt,
+        };
+        if (phases.firstByteAt !== null) {
+          fields['firstByteAt'] = phases.firstByteAt;
+        }
+        if (phases.lastByteAt !== null) {
+          fields['lastByteAt'] = phases.lastByteAt;
+        }
+        if (phases.diskDrainDoneAt !== null) {
+          fields['diskDrainDoneAt'] = phases.diskDrainDoneAt;
+        }
+        await appendBenchMarker(log, 'bulk-recv-phases', fields).catch((err) =>
+          logSyncError('bulk-recv-phases', err),
+        );
+        await appendBenchMarker(log, 'block-stream-end', {
+          hash: stream.hash.slice(0, 16),
+          bytes: stream.total,
+        }).catch((err) => logSyncError('block-stream-end', err));
+        return;
+      }
+      const digest = stream.hasher.digest('hex');
+      if (digest !== stream.hash.toLowerCase()) {
         logSyncError(
           `block stream hash mismatch ${stream.hash.slice(0, 16)}`,
-          new Error('disk block stream verify failed'),
+          new Error(`expected ${stream.hash.slice(0, 16)} got ${digest.slice(0, 16)}`),
         );
         return;
       }
-      await markBlockStored(stream.hash, stream.total);
-      const phases = result.phases;
-      const fields: Record<string, string | number | boolean> = {
-        hash: stream.hash.slice(0, 16),
-        bytes: stream.total,
-        hashDoneAt: phases.hashDoneAt,
-        renameDoneAt: phases.renameDoneAt,
-      };
-      if (phases.firstByteAt !== null) {
-        fields['firstByteAt'] = phases.firstByteAt;
-      }
-      if (phases.lastByteAt !== null) {
-        fields['lastByteAt'] = phases.lastByteAt;
-      }
-      if (phases.diskDrainDoneAt !== null) {
-        fields['diskDrainDoneAt'] = phases.diskDrainDoneAt;
-      }
-      await appendBenchMarker(log, 'bulk-recv-phases', fields).catch((err) =>
-        logSyncError('bulk-recv-phases', err),
-      );
-      await appendBenchMarker(log, 'block-stream-end', {
-        hash: stream.hash.slice(0, 16),
-        bytes: stream.total,
-      }).catch((err) => logSyncError('block-stream-end', err));
-      return;
+      await onBlockStream(stream.hash, stream.buffer);
+    } finally {
+      finishingIncoming = false;
     }
-    const digest = stream.hasher.digest('hex');
-    if (digest !== stream.hash.toLowerCase()) {
-      logSyncError(
-        `block stream hash mismatch ${stream.hash.slice(0, 16)}`,
-        new Error(`expected ${stream.hash.slice(0, 16)} got ${digest.slice(0, 16)}`),
-      );
-      return;
-    }
-    await onBlockStream(stream.hash, stream.buffer);
   };
 
   const ingestStreamBytes = (chunk: Uint8Array): void => {
     const stream = incoming;
     if (!stream) {
+      if (decodeControl.blockStreamState() !== null) {
+        throw new Error('block stream bytes without active incoming receiver state');
+      }
       return;
     }
-    stallGuard?.touchStream();
     if (stream.mode === 'disk') {
       stream.sink.ingest(chunk);
       if (stream.sink.received >= stream.sink.total) {
@@ -1169,9 +1166,46 @@ export function attachPeerSession(
     onBlockStreamBytes: ingestStreamBytes,
   });
 
+  const isInboundBlockStreamActive = (): boolean => {
+    return incoming !== null || decodeControl.blockStreamState() !== null;
+  };
+
+  const syncInboundStreamStallGuard = (): void => {
+    if (stallGuard === null) {
+      return;
+    }
+    if (isInboundBlockStreamActive()) {
+      if (!incomingStreamActive) {
+        incomingStreamActive = true;
+        stallGuard.armStream();
+      } else {
+        stallGuard.touchStream();
+      }
+      return;
+    }
+    if (incomingStreamActive) {
+      incomingStreamActive = false;
+      stallGuard.clearStream();
+    }
+  };
+
+  if (options.onSessionStall !== undefined) {
+    stallGuard = new SessionStallGuard(
+      options.onSessionStall,
+      () => ({
+        wantsPending: claimedHashes.size,
+        streamActive: isInboundBlockStreamActive(),
+        outboundActive: stallGuard?.isOutboundActive() ?? false,
+        resumeInFlight: !resumeWalkDone && resumeWalkInFlight !== undefined,
+      }),
+      options.sessionConnectedAt ?? Date.now(),
+    );
+  }
+
   peer.onData((chunk) => {
     try {
       decodeControl(chunk);
+      syncInboundStreamStallGuard();
     } catch (err) {
       logSyncError('wire decode', err);
       peer.close();
