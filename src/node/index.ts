@@ -13,6 +13,7 @@ export {
   type PeerConnectedEvent,
   type PeerDisconnectedEvent,
   type PeerConnectFailedEvent,
+  type PeerStalledEvent,
   type BlockSentEvent,
   type BlockReceivedEvent,
   type EventReceivedEvent,

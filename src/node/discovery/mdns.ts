@@ -246,6 +246,15 @@ export function createMdnsDiscovery(options: {
       peerHandler = handler;
     },
 
+    forgetTcpPeer(profilePublicKey: string, instancePublicKey: string): void {
+      const prefix = `${profilePublicKey.toLowerCase()}:${instancePublicKey.toLowerCase()}:`;
+      for (const key of seenTcp) {
+        if (key.startsWith(prefix)) {
+          seenTcp.delete(key);
+        }
+      }
+    },
+
     async stop(): Promise<void> {
       if (multicastTimer) {
         clearInterval(multicastTimer);

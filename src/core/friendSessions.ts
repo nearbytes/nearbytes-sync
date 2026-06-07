@@ -200,10 +200,32 @@ export class FriendSessionRegistry {
     let alive = true;
     let entry: FriendSessionEntry;
     const sessionEmitter = this.makeSessionEmitter(remote, remotePid, remoteInstance);
-    const optionsWithEvents: AttachPeerSessionOptions =
-      sessionEmitter !== undefined
-        ? { ...sessionOptions, events: sessionEmitter }
-        : sessionOptions;
+    const connectedAt = Date.now();
+    const localAssoc = localAssociationProfile.toLowerCase();
+    const role: 'sibling' | 'friend' =
+      localAssoc !== '' && localAssoc === remote ? 'sibling' : 'friend';
+    const optionsWithEvents: AttachPeerSessionOptions = {
+      ...sessionOptions,
+      sessionConnectedAt: connectedAt,
+      ...(sessionEmitter !== undefined ? { events: sessionEmitter } : {}),
+      ...(this.bus !== undefined
+        ? {
+            onSessionStall: (reason) => {
+              this.bus!.emit({
+                kind: 'peer-stalled',
+                at: Date.now(),
+                reason,
+                remoteProfilePublicKey: remote,
+                remoteInstancePublicKey: remoteInstance,
+                remotePeerId: remotePid,
+                transportLabel,
+                role,
+              });
+              peer.close();
+            },
+          }
+        : {}),
+    };
     const stop = attachPeerSession(log, subject, peer, () => {
       const wasAlive = alive;
       alive = false;
@@ -226,7 +248,7 @@ export class FriendSessionRegistry {
       remoteInstancePublicKey: remoteInstance,
       remotePeerId: remotePid,
       transportLabel,
-      connectedAt: new Date(),
+      connectedAt: new Date(connectedAt),
       localAssociationProfile: localAssociationProfile.toLowerCase(),
       locallyInitiated,
       stop,

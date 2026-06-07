@@ -358,6 +358,7 @@ export async function start(
       case 'peer-connected':
       case 'peer-disconnected':
       case 'peer-connect-failed':
+      case 'peer-stalled':
         // Peer transitions do not move bytes; nothing to accumulate.
         break;
     }
@@ -410,6 +411,13 @@ export async function start(
           syncTimelineMark(e.transportLabel, 'connect-failed', `${e.reason} attempts=${e.attempts}`);
           syncTimelineClear(e.transportLabel);
           break;
+        case 'peer-stalled':
+          syncTimelineMark(
+            syncTimelineKey(e.remoteProfilePublicKey, e.remoteInstancePublicKey),
+            'stalled',
+            e.reason,
+          );
+          break;
         default:
           break;
       }
@@ -417,6 +425,14 @@ export async function start(
   }
 
   const friendSessions = new FriendSessionRegistry(eventBus);
+  if (mdnsBackend?.forgetTcpPeer) {
+    const forgetTcpPeer = mdnsBackend.forgetTcpPeer.bind(mdnsBackend);
+    eventBus.onEvent((e) => {
+      if (e.kind === 'peer-disconnected') {
+        forgetTcpPeer(e.remoteProfilePublicKey, e.remoteInstancePublicKey);
+      }
+    });
+  }
   const connectingPairs = new Set<string>();
   const handshakingDuplexes = new WeakSet<DuplexPeer>();
   let sessionFirstPeerSeen = false;

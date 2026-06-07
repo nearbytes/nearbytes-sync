@@ -47,4 +47,6 @@ export interface PeerDiscovery {
   start(): Promise<void>;
   onPeer(handler: (peer: DiscoveredPeer) => void): void;
   stop(): Promise<void>;
+  /** mDNS only (DISC-24.1): allow outbound re-dial after association close. */
+  forgetTcpPeer?(profilePublicKey: string, instancePublicKey: string): void;
 }

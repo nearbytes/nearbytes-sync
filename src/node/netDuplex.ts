@@ -1,5 +1,6 @@
 import type { Socket } from 'net';
 import type { DuplexPeer } from '../core/peerLoop.js';
+import { TCP_KEEPALIVE_INITIAL_DELAY_SEC } from '../core/connectionHealth.js';
 import { logSyncError } from '../logSyncError.js';
 
 /** Node TCP peer with direct socket access for nc-style bulk block I/O. */
@@ -9,6 +10,7 @@ export type TcpDuplexPeer = DuplexPeer & {
 
 export function tuneTcpSocket(socket: Socket): void {
   socket.setNoDelay(true);
+  socket.setKeepAlive(true, TCP_KEEPALIVE_INITIAL_DELAY_SEC);
   try {
     const tunable = socket as Socket & {
       setSendBufferSize?(size: number): void;

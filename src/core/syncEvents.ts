@@ -24,7 +24,7 @@
  *    in-process and serialised shapes are identical — no marshalling
  *    boundary, no Date↔string conversion drift between LIVE and
  *    DAEMON modes in the monitor UI.
- *  - The discriminated union is closed and small (six kinds today).
+ *  - The discriminated union is closed and small (seven kinds today).
  *    Adding a kind is a breaking change for exhaustive switches in
  *    consumers, which is intentional: a new kind without a UI label
  *    would be silently invisible to operators.
@@ -83,6 +83,23 @@ export interface PeerConnectFailedEvent {
   readonly remotePeerId: string;
 }
 
+/**
+ * Live association torn down because in-flight work stalled or a quiescent
+ * session reached its rotation age (SYNC-64/65, OBS-64). Emitted before
+ * `peer-disconnected`.
+ */
+export interface PeerStalledEvent {
+  readonly kind: 'peer-stalled';
+  readonly at: number;
+  /** Machine tag: `want-timeout`, `stream-timeout`, `session-rotation`, … */
+  readonly reason: string;
+  readonly remoteProfilePublicKey: string;
+  readonly remoteInstancePublicKey: string;
+  readonly remotePeerId: string;
+  readonly transportLabel: string;
+  readonly role: 'sibling' | 'friend';
+}
+
 /** A block stream finished pumping to a specific peer (outbound). */
 export interface BlockSentEvent {
   readonly kind: 'block-sent';
@@ -126,6 +143,7 @@ export type SyncEvent =
   | PeerConnectedEvent
   | PeerDisconnectedEvent
   | PeerConnectFailedEvent
+  | PeerStalledEvent
   | BlockSentEvent
   | BlockReceivedEvent
   | EventReceivedEvent;

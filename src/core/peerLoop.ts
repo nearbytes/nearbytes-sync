@@ -36,6 +36,10 @@ import {
 } from './sessionRegistry.js';
 import { inflightBlockRegistry, outboundBlockStreamCounter } from './inflightBlocks.js';
 import {
+  SessionStallGuard,
+  type StallReason,
+} from './connectionHealth.js';
+import {
   NOOP_PEER_SESSION_EVENT_EMITTER,
   type PeerSessionEventEmitter,
 } from './syncEvents.js';
@@ -111,6 +115,10 @@ export interface AttachPeerSessionOptions {
   readonly events?: PeerSessionEventEmitter;
   /** Stable key for `--debug timeline` (`profile|instance` or discovery label). */
   readonly timelineKey?: string;
+  /** Called before forced close when an in-flight stall or rotation fires. */
+  readonly onSessionStall?: (reason: StallReason) => void;
+  /** Epoch ms when the association became live (for session rotation). */
+  readonly sessionConnectedAt?: number;
 }
 
 function isMissingLocalObjectError(err: unknown): boolean {
@@ -288,9 +296,11 @@ function sendBlockStream(
   bytes: Uint8Array | null,
   totalBytes: number,
   sessionEvents: PeerSessionEventEmitter,
+  stallGuard: SessionStallGuard | null,
 ): void {
   const outboundCounter = outboundBlockStreamCounter(log);
   outboundCounter.begin();
+  stallGuard?.armOutbound();
   runOutbound(async () => {
     try {
       let pumped: { bytes: number; pumpBeginAt: number; pumpEndAt: number } | null = null;
@@ -332,6 +342,7 @@ function sendBlockStream(
       }
       logSyncError(`sendBlockStream:${ref.hash.slice(0, 16)}`, err);
     } finally {
+      stallGuard?.clearOutbound();
       outboundCounter.end();
     }
   });
@@ -400,6 +411,9 @@ export function attachPeerSession(
     runOutbound(write);
   };
 
+  let resumeWalkInFlight: string | undefined;
+  let incomingStreamActive = false;
+
   /**
    * Per-Log inflight block tracker (SYNC: at-most-one `want(H)` across sessions).
    *
@@ -410,6 +424,20 @@ export function attachPeerSession(
    */
   const inflight = inflightBlockRegistry(log);
   const claimedHashes = new Set<string>();
+
+  let stallGuard: SessionStallGuard | null = null;
+  if (options.onSessionStall !== undefined) {
+    stallGuard = new SessionStallGuard(
+      options.onSessionStall,
+      () => ({
+        wantsPending: claimedHashes.size,
+        streamActive: incomingStreamActive,
+        outboundActive: stallGuard?.isOutboundActive() ?? false,
+        resumeInFlight: resumeWalkInFlight !== undefined,
+      }),
+      options.sessionConnectedAt ?? Date.now(),
+    );
+  }
 
   const missingRefsForWant = async (refs: readonly ObjectRef[]): Promise<ObjectRef[]> => {
     const missing: ObjectRef[] = [];
@@ -459,6 +487,7 @@ export function attachPeerSession(
     const key = hash.toLowerCase();
     if (claimedHashes.delete(key)) {
       inflight.release(key);
+      stallGuard?.clearWant(key);
     }
   };
 
@@ -575,6 +604,11 @@ export function attachPeerSession(
     }
     if (blocks.length > 0) {
       syncDebugLine('wire', `want → blocks=${blocks.length}`);
+      for (const ref of blocks) {
+        if (ref.kind === 'block') {
+          stallGuard?.armWant(ref.hash);
+        }
+      }
       send({ type: 'want', objects: blocks });
     }
     if (events.length > 0) {
@@ -627,7 +661,6 @@ export function attachPeerSession(
    * answers only advance the walk when tagged with `fromCursor`. Unsolicited
    * tail `have` (SYNC-21c) and live pushes (SYNC-10) may still drive `want`.
    */
-  let resumeWalkInFlight: string | undefined;
   let resumeWalkDone = false;
   let resumeWalkRewound = false;
   /** Dedupe attach `delta` + `subscribe` to one journal page per cursor. */
@@ -642,6 +675,7 @@ export function attachPeerSession(
       return;
     }
     resumeWalkInFlight = key;
+    stallGuard?.armResume();
     const tl = options.timelineKey;
     if (tl !== undefined) {
       syncTimelineMark(tl, 'page→', `cursor=${cursor ?? 'start'}`);
@@ -652,6 +686,7 @@ export function attachPeerSession(
   const finishResumeWalk = (): void => {
     resumeWalkDone = true;
     resumeWalkInFlight = undefined;
+    stallGuard?.clearResume();
     scheduleOrphanRepair();
   };
 
@@ -682,6 +717,7 @@ export function attachPeerSession(
       return;
     }
     resumeWalkInFlight = undefined;
+    stallGuard?.clearResume();
 
     if (msg.objects.length === 0 && !msg.more) {
       void (async () => {
@@ -755,6 +791,7 @@ export function attachPeerSession(
       syncTimelineMark(tl, 'resume-sent', `cursor=${resumeCursor ?? 'start'}`);
     }
     resumeWalkInFlight = resumeCursorKey(resumeCursor);
+    stallGuard?.armResume();
     send(buildResumeDelta(subject, resumeCursor), true);
     send(buildResumeSubscribe(subject, resumeCursor), true);
     void (async () => {
@@ -836,13 +873,23 @@ export function attachPeerSession(
         }
         if (storageRoot) {
           blockServed += 1;
-          sendBlockStream(log, runOutbound, peer, storageRoot, ref, null, 0, sessionEvents);
+          sendBlockStream(log, runOutbound, peer, storageRoot, ref, null, 0, sessionEvents, stallGuard);
           continue;
         }
         const bytes = await readLocalBytes(log, ref);
         if (bytes) {
           blockServed += 1;
-          sendBlockStream(log, runOutbound, peer, storageRoot, ref, bytes, bytes.byteLength, sessionEvents);
+          sendBlockStream(
+            log,
+            runOutbound,
+            peer,
+            storageRoot,
+            ref,
+            bytes,
+            bytes.byteLength,
+            sessionEvents,
+            stallGuard,
+          );
         } else {
           blockMissingLocal += 1;
         }
@@ -985,6 +1032,8 @@ export function attachPeerSession(
       return;
     }
     incoming = null;
+    incomingStreamActive = false;
+    stallGuard?.clearStream();
     clearBulkInbound();
     releaseBlockClaim(stream.hash);
     if (stream.mode === 'discard') {
@@ -1041,6 +1090,7 @@ export function attachPeerSession(
     if (!stream) {
       return;
     }
+    stallGuard?.touchStream();
     if (stream.mode === 'disk') {
       stream.sink.ingest(chunk);
       if (stream.sink.received >= stream.sink.total) {
@@ -1076,6 +1126,9 @@ export function attachPeerSession(
     if (incoming !== null) {
       throw new Error('block stream already active');
     }
+    stallGuard?.clearWant(hash);
+    incomingStreamActive = true;
+    stallGuard?.armStream();
     if (storageRoot && diskBlockStream) {
       const abs = join(storageRoot, blockPath(hash as Hash));
       if (existsSync(abs)) {
@@ -1132,6 +1185,7 @@ export function attachPeerSession(
   runAttachSync();
 
   const stop = (): void => {
+    stallGuard?.stop();
     unregister();
     for (const key of claimedHashes) {
       inflight.release(key);
