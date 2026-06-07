@@ -339,6 +339,15 @@ export async function start(
   const eventBus = new SyncEventBus();
   const eventBuffer = new SyncEventBuffer();
   eventBus.onEvent((e) => eventBuffer.push(e));
+  eventBus.onEvent((e) => {
+    if (e.kind === 'peer-stalled') {
+      void appendBenchMarker(log, 'peer-stalled', {
+        reason: e.reason,
+        transport: e.transportLabel,
+        role: e.role,
+      }).catch(() => undefined);
+    }
+  });
 
   // Cumulative + windowed throughput counters. Driven by the same bus
   // as the ring buffer so a UI does not need a second subscription;
