@@ -317,7 +317,8 @@ function sendBlockStream(
       let pumped: { bytes: number; pumpBeginAt: number; pumpEndAt: number } | null = null;
       if (storageRoot) {
         const { isTcpDuplexPeer } = await import('../node/netDuplex.js');
-        if (isTcpDuplexPeer(peer)) {
+        const tcpBulkOn = process.env['NEARBYTES_OPT_TCP_BULK'] !== '0';
+        if (tcpBulkOn && isTcpDuplexPeer(peer)) {
           const { pumpBlockFileOverSocket } = await import('../node/tcpBulk.js');
           pumped = await pumpBlockFileOverSocket(peer.tcpSocket, storageRoot, ref.hash);
         } else {

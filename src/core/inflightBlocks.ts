@@ -47,6 +47,10 @@ export class InflightBlockRegistry {
   /** Returns true iff `hash` was not in-flight and is now reserved by the caller. */
   claim(hash: string): boolean {
     const key = hash.toLowerCase();
+    if (process.env['NEARBYTES_OPT_INFLIGHT_DEDUP'] === '0') {
+      this.inflight.add(key);
+      return true;
+    }
     if (this.inflight.has(key)) return false;
     this.inflight.add(key);
     return true;
