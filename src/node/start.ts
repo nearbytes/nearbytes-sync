@@ -28,7 +28,11 @@ import { exchangeFriendHandshake, SyncHandshakeError } from '../core/handshake.j
 import type { DuplexPeer } from '../core/peerLoop.js';
 import { FriendSessionRegistry } from '../core/friendSessions.js';
 import { createNodeDiskBlockStreamFactory } from './blockReceive.js';
-import { inflightBlockRegistry, outboundBlockStreamCounter } from '../core/inflightBlocks.js';
+import {
+  inflightBlockRegistry,
+  inflightBlockRegistryForStorage,
+  outboundBlockStreamCounter,
+} from '../core/inflightBlocks.js';
 import { acquireSyncLock } from './dataDirLock.js';
 import { createFetchCursorStore } from './fetchCursors.js';
 import { loadOrCreateInstanceIdentity, peekInstancePublicKey } from './instanceIdentity.js';
@@ -724,7 +728,10 @@ export async function start(
     serve: servedSet.size,
   });
 
-  const inbound = inflightBlockRegistry(log);
+  const inbound =
+    options.blockStorageRoot !== undefined
+      ? inflightBlockRegistryForStorage(options.blockStorageRoot)
+      : inflightBlockRegistry(log);
   const outbound = outboundBlockStreamCounter(log);
   return {
     friends,

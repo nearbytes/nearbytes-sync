@@ -34,7 +34,15 @@ import {
   registerLocalHaveAnnouncer,
   type LocalHaveAnnouncer,
 } from './sessionRegistry.js';
-import { inflightBlockRegistry, outboundBlockStreamCounter } from './inflightBlocks.js';
+import {
+  claimOutboundServe,
+  clearBlockSettling,
+  inflightBlockRegistry,
+  inflightBlockRegistryForStorage,
+  markBlockSettling,
+  outboundBlockStreamCounter,
+  releaseOutboundServe,
+} from './inflightBlocks.js';
 import {
   SessionStallGuard,
   type StallReason,
@@ -298,6 +306,9 @@ function sendBlockStream(
   sessionEvents: PeerSessionEventEmitter,
   stallGuard: SessionStallGuard | null,
 ): void {
+  if (storageRoot !== undefined && !claimOutboundServe(storageRoot, ref.hash)) {
+    return;
+  }
   const outboundCounter = outboundBlockStreamCounter(log);
   outboundCounter.begin();
   stallGuard?.armOutbound();
@@ -337,6 +348,9 @@ function sendBlockStream(
         sessionEvents.blockSent(ref.hash, pumped.bytes);
       }
     } catch (err) {
+      if (storageRoot !== undefined && isMissingLocalObjectError(err)) {
+        releaseOutboundServe(storageRoot, ref.hash);
+      }
       if (isMissingLocalObjectError(err)) {
         return;
       }
@@ -413,7 +427,6 @@ export function attachPeerSession(
 
   let resumeWalkInFlight: string | undefined;
   let incomingStreamActive = false;
-  let finishingIncoming = false;
 
   /**
    * Per-Log inflight block tracker (SYNC: at-most-one `want(H)` across sessions).
@@ -423,7 +436,10 @@ export function attachPeerSession(
    * slots owned by sibling sessions. Slots are released either when the
    * incoming stream for that hash completes (any outcome) or on session stop.
    */
-  const inflight = inflightBlockRegistry(log);
+  const inflight =
+    storageRoot !== undefined
+      ? inflightBlockRegistryForStorage(storageRoot)
+      : inflightBlockRegistry(log);
   const claimedHashes = new Set<string>();
 
   let stallGuard: SessionStallGuard | null = null;
@@ -467,7 +483,7 @@ export function attachPeerSession(
 
   const claimBlockWant = (hash: string): boolean => {
     const key = hash.toLowerCase();
-    if (claimedHashes.has(key)) return true;
+    if (claimedHashes.has(key)) return false;
     if (!inflight.claim(key)) return false;
     claimedHashes.add(key);
     return true;
@@ -854,32 +870,16 @@ export function attachPeerSession(
         if (ref.kind !== 'block') {
           continue;
         }
+        if (storageRoot === undefined) {
+          blockMissingLocal += 1;
+          continue;
+        }
         if (!(await blockReadable(log, storageRoot, ref.hash as Hash))) {
           blockMissingLocal += 1;
           continue;
         }
-        if (storageRoot) {
-          blockServed += 1;
-          sendBlockStream(log, runOutbound, peer, storageRoot, ref, null, 0, sessionEvents, stallGuard);
-          continue;
-        }
-        const bytes = await readLocalBytes(log, ref);
-        if (bytes) {
-          blockServed += 1;
-          sendBlockStream(
-            log,
-            runOutbound,
-            peer,
-            storageRoot,
-            ref,
-            bytes,
-            bytes.byteLength,
-            sessionEvents,
-            stallGuard,
-          );
-        } else {
-          blockMissingLocal += 1;
-        }
+        blockServed += 1;
+        sendBlockStream(log, runOutbound, peer, storageRoot, ref, null, 0, sessionEvents, stallGuard);
       }
       syncDebugLine(
         'wire',
@@ -1013,22 +1013,26 @@ export function attachPeerSession(
     scheduleOrphanRepair();
   };
 
-  const finishIncomingStream = async (): Promise<void> => {
-    if (finishingIncoming) {
-      return;
-    }
+  /** Drop the live `incoming` slot so the wire decoder can accept the next stream-begin in the same TCP chunk. */
+  const detachIncomingStream = (): IncomingBlockStream | null => {
     const stream = incoming;
     if (!stream) {
-      return;
+      return null;
     }
-    finishingIncoming = true;
     incoming = null;
     incomingStreamActive = false;
     stallGuard?.clearStream();
     clearBulkInbound();
     releaseBlockClaim(stream.hash);
+    return stream;
+  };
+
+  const finalizeIncomingStream = async (stream: IncomingBlockStream): Promise<void> => {
     try {
       if (stream.mode === 'discard') {
+        if (storageRoot !== undefined) {
+          clearBlockSettling(storageRoot, stream.hash);
+        }
         return;
       }
       if (stream.mode === 'disk') {
@@ -1038,9 +1042,15 @@ export function attachPeerSession(
             `block stream hash mismatch ${stream.hash.slice(0, 16)}`,
             new Error('disk block stream verify failed'),
           );
+          if (storageRoot !== undefined) {
+            clearBlockSettling(storageRoot, stream.hash);
+          }
           return;
         }
         await markBlockStored(stream.hash, stream.total);
+        if (storageRoot !== undefined) {
+          clearBlockSettling(storageRoot, stream.hash);
+        }
         const phases = result.phases;
         const fields: Record<string, string | number | boolean> = {
           hash: stream.hash.slice(0, 16),
@@ -1072,12 +1082,31 @@ export function attachPeerSession(
           `block stream hash mismatch ${stream.hash.slice(0, 16)}`,
           new Error(`expected ${stream.hash.slice(0, 16)} got ${digest.slice(0, 16)}`),
         );
+        if (storageRoot !== undefined) {
+          clearBlockSettling(storageRoot, stream.hash);
+        }
         return;
       }
       await onBlockStream(stream.hash, stream.buffer);
-    } finally {
-      finishingIncoming = false;
+      if (storageRoot !== undefined) {
+        clearBlockSettling(storageRoot, stream.hash);
+      }
+    } catch (err) {
+      logSyncError('finalizeIncomingStream', err);
+      if (storageRoot !== undefined) {
+        clearBlockSettling(storageRoot, stream.hash);
+      }
     }
+  };
+
+  const scheduleIncomingStreamFinalize = (): void => {
+    const stream = detachIncomingStream();
+    if (!stream) {
+      return;
+    }
+    void finalizeIncomingStream(stream).catch((err) =>
+      logSyncError('finalizeIncomingStream', err),
+    );
   };
 
   const ingestStreamBytes = (chunk: Uint8Array): void => {
@@ -1091,14 +1120,14 @@ export function attachPeerSession(
     if (stream.mode === 'disk') {
       stream.sink.ingest(chunk);
       if (stream.sink.received >= stream.sink.total) {
-        void finishIncomingStream().catch((err) => logSyncError('finishIncomingStream', err));
+        scheduleIncomingStreamFinalize();
       }
       return;
     }
     if (stream.mode === 'discard') {
       stream.received = Math.min(stream.total, stream.received + chunk.byteLength);
       if (stream.received >= stream.total) {
-        void finishIncomingStream().catch((err) => logSyncError('finishIncomingStream', err));
+        scheduleIncomingStreamFinalize();
       }
       return;
     }
@@ -1115,13 +1144,16 @@ export function attachPeerSession(
       ingestStreamBytes(chunk.subarray(take));
     }
     if (stream.received === stream.total) {
-      void finishIncomingStream().catch((err) => logSyncError('finishIncomingStream', err));
+      scheduleIncomingStreamFinalize();
     }
   };
 
   const beginIncomingBlockStream = (hash: string, total: number): void => {
     if (incoming !== null) {
-      throw new Error('block stream already active');
+      if (!blockStreamComplete()) {
+        throw new Error('block stream already active');
+      }
+      scheduleIncomingStreamFinalize();
     }
     stallGuard?.clearWant(hash);
     incomingStreamActive = true;
@@ -1132,6 +1164,9 @@ export function attachPeerSession(
         incoming = { mode: 'discard', hash, total, received: 0 };
         return;
       }
+      if (storageRoot !== undefined) {
+        markBlockSettling(storageRoot, hash);
+      }
       const sink = diskBlockStream.create(hash, total);
       incoming = { mode: 'disk', hash, total, sink };
       // Keep the wire decoder on the socket so urgent `have` / event frames can
@@ -1140,6 +1175,9 @@ export function attachPeerSession(
     }
     if (total > MAX_BLOCK_STREAM_BUFFER_BYTES) {
       throw new Error(`block stream ${total} B exceeds in-memory limit ${MAX_BLOCK_STREAM_BUFFER_BYTES}`);
+    }
+    if (storageRoot !== undefined) {
+      markBlockSettling(storageRoot, hash);
     }
     incoming = {
       mode: 'memory',
