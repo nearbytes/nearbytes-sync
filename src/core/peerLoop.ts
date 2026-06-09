@@ -249,8 +249,7 @@ async function hasObject(
   if (!pk) {
     return false;
   }
-  const events = await log.events.listEvents(pk);
-  return events.includes(ref.hash as Hash);
+  return log.events.hasEvent(pk, ref.hash as Hash);
 }
 
 /** Reception journal may list objects evicted from blocks/ or channels/ — do not advertise them. */
@@ -447,25 +446,17 @@ export function attachPeerSession(
 
   const missingRefsForWant = async (refs: readonly ObjectRef[]): Promise<ObjectRef[]> => {
     const missing: ObjectRef[] = [];
-    const channelEvents = new Map<string, Set<string>>();
     const batchSize = 32;
 
     const refPresent = async (ref: ObjectRef): Promise<boolean> => {
       if (ref.kind === 'block') {
         return blockReadable(log, storageRoot, ref.hash as Hash);
       }
-      const channel = ref.channel.toLowerCase();
-      let known = channelEvents.get(channel);
-      if (known === undefined) {
-        const pk = publicKeyFromHex(ref.channel);
-        if (pk === null) {
-          return false;
-        }
-        const hashes = await log.events.listEvents(pk);
-        known = new Set(hashes.map((h) => h.toLowerCase()));
-        channelEvents.set(channel, known);
+      const pk = publicKeyFromHex(ref.channel);
+      if (pk === null) {
+        return false;
       }
-      return known.has(ref.hash.toLowerCase());
+      return log.events.hasEvent(pk, ref.hash as Hash);
     };
 
     for (let i = 0; i < refs.length; i += batchSize) {
@@ -934,7 +925,6 @@ export function attachPeerSession(
             sendWants(wants);
           }
         }
-        scheduleOrphanRepair();
       }
     }
   };
@@ -952,7 +942,6 @@ export function attachPeerSession(
         bytes: bytes.byteLength,
       });
       sessionEvents.blockReceived(hash, bytes.byteLength);
-      scheduleOrphanRepair();
     }
   };
 
@@ -1011,7 +1000,6 @@ export function attachPeerSession(
       bytes,
     });
     sessionEvents.blockReceived(hash, bytes);
-    scheduleOrphanRepair();
   };
 
   /** Drop the live `incoming` slot so the wire decoder can accept the next stream-begin in the same TCP chunk. */

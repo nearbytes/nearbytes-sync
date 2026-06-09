@@ -51,7 +51,7 @@ export async function acceptData(
   const serialized = JSON.parse(new TextDecoder().decode(bytes)) as SerializedEvent;
   const event = deserializeEvent(serialized);
   const eventHash = ref.hash as Hash;
-  if (await log.events.listEvents(publicKey).then((h) => h.includes(eventHash))) {
+  if (await log.events.hasEvent(publicKey, eventHash)) {
     return 'duplicate';
   }
   await log.events.storeEvent(publicKey, event);
