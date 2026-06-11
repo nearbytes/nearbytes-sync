@@ -29,6 +29,22 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@noble/curves@npm:^1.9.7":
+  version: 1.9.7
+  resolution: "@noble/curves@npm:1.9.7"
+  dependencies:
+    "@noble/hashes": "npm:1.8.0"
+  checksum: 10c0/150014751ebe8ca06a8654ca2525108452ea9ee0be23430332769f06808cddabfe84f248b6dbf836916bc869c27c2092957eec62c7506d68a1ed0a624017c2a3
+  languageName: node
+  linkType: hard
+
+"@noble/hashes@npm:1.8.0":
+  version: 1.8.0
+  resolution: "@noble/hashes@npm:1.8.0"
+  checksum: 10c0/06a0b52c81a6fa7f04d67762e08b2c476a00285858150caeaaff4037356dd5e119f45b2a530f638b77a5eeca013168ec1b655db41bae3236cb2e9d511484fc77
+  languageName: node
+  linkType: hard
+
 "@types/node@npm:^20.10.0":
   version: 20.19.41
   resolution: "@types/node@npm:20.19.41"
@@ -489,17 +505,23 @@ __metadata:
   languageName: node
   linkType: hard
 
-"nearbytes-crypto@link:../nearbytes-crypto::locator=nearbytes-sync%40workspace%3A.":
-  version: 0.0.0-use.local
-  resolution: "nearbytes-crypto@link:../nearbytes-crypto::locator=nearbytes-sync%40workspace%3A."
+"nearbytes-crypto@github:nearbytes/nearbytes-crypto":
+  version: 0.1.0
+  resolution: "nearbytes-crypto@https://github.com/nearbytes/nearbytes-crypto.git#commit=1e4fdba874181eea145107d2693bee0d367853d8"
+  dependencies:
+    "@noble/curves": "npm:^1.9.7"
+  checksum: 10c0/78e1586f726c58185ab8461e0f4ecdee943489aa3e93a824c95fecaa88920fd08759d8494ad5ef1c0f32edb3c374822209af8dbbc9f20bdfbfe052a9ce010124
   languageName: node
-  linkType: soft
+  linkType: hard
 
-"nearbytes-log@link:../nearbytes-log::locator=nearbytes-sync%40workspace%3A.":
-  version: 0.0.0-use.local
-  resolution: "nearbytes-log@link:../nearbytes-log::locator=nearbytes-sync%40workspace%3A."
+"nearbytes-log@https://github.com/nearbytes/nearbytes-log.git#commit=32a77dc63f63dbbda8fc74bc4b8cbca2459a3888":
+  version: 0.1.0
+  resolution: "nearbytes-log@https://github.com/nearbytes/nearbytes-log.git#commit=32a77dc63f63dbbda8fc74bc4b8cbca2459a3888"
+  dependencies:
+    nearbytes-crypto: "github:nearbytes/nearbytes-crypto"
+  checksum: 10c0/af5cfb8ab37b46eeca0bc7e8aa5248b29561d210982e37d616893e4b13c635304694656de6ae38ad68cb93a1e9e8ad2ee11ec52e26ee919ca51406dfa2879487
   languageName: node
-  linkType: soft
+  linkType: hard
 
 "nearbytes-sync@workspace:.":
   version: 0.0.0-use.local
@@ -509,8 +531,8 @@ __metadata:
     bonjour-service: "npm:^1.2.1"
     chokidar: "npm:^4.0.3"
     hyperswarm: "npm:^4.8.2"
-    nearbytes-crypto: "link:../nearbytes-crypto"
-    nearbytes-log: "link:../nearbytes-log"
+    nearbytes-crypto: "github:nearbytes/nearbytes-crypto"
+    nearbytes-log: "https://github.com/nearbytes/nearbytes-log.git#commit=32a77dc63f63dbbda8fc74bc4b8cbca2459a3888"
     typescript: "npm:^5.3.2"
   bin:
     nbsync: ./bin/nbsync.mjs

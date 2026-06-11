@@ -50,8 +50,8 @@
     "bonjour-service": "^1.2.1",
     "chokidar": "^4.0.3",
     "hyperswarm": "^4.8.2",
-    "nearbytes-crypto": "link:../nearbytes-crypto",
-    "nearbytes-log": "link:../nearbytes-log"
+    "nearbytes-crypto": "github:nearbytes/nearbytes-crypto",
+    "nearbytes-log": "https://github.com/nearbytes/nearbytes-log.git#commit=32a77dc63f63dbbda8fc74bc4b8cbca2459a3888"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
