@@ -56,6 +56,10 @@ function requireLinux() {
 }
 
 function findNodeBinary() {
+  const fromEnv = process.env.NB_NODE_BIN;
+  if (typeof fromEnv === 'string' && fromEnv.length > 0 && existsSync(fromEnv)) {
+    return fromEnv;
+  }
   // process.execPath is the absolute path to the node binary running
   // this script — the most reliable source. Falls back to PATH lookup
   // only if execPath is somehow missing (it never is on a real Node).

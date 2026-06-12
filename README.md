@@ -59,11 +59,15 @@ systemctl --user status        nearbytes-syncd
 journalctl  --user  -u         nearbytes-syncd -f
 ```
 
-To pull the latest code, rebuild, refresh the unit, and restart the daemon in one step:
+To pull the latest code, rebuild, refresh the unit (pinning the Node 22+
+binary from `.nvmrc`), restart immediately, and verify the service is healthy:
 
 ```sh
 yarn daemon:update
 ```
+
+Requires Node >= 22.13 (`node:sqlite` for `nearbytes-log`). The script
+auto-installs from `.nvmrc` under `.local/toolchain` when fnm/nvm are absent.
 
 To pick up config changes without a full restart, either save `~/.nearbytes/config.json` (the daemon's `fs.watch` fires within 250 ms) or `systemctl --user reload nearbytes-syncd` (sends `SIGHUP`).
 

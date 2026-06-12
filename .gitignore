@@ -1,4 +1,5 @@
 node_modules/
+.local/
 dist/
 package-lock.json
 .yarn/install-state.gz
