@@ -59,6 +59,12 @@ systemctl --user status        nearbytes-syncd
 journalctl  --user  -u         nearbytes-syncd -f
 ```
 
+To pull the latest code, rebuild, refresh the unit, and restart the daemon in one step:
+
+```sh
+yarn daemon:update
+```
+
 To pick up config changes without a full restart, either save `~/.nearbytes/config.json` (the daemon's `fs.watch` fires within 250 ms) or `systemctl --user reload nearbytes-syncd` (sends `SIGHUP`).
 
 To uninstall: `yarn uninstall:systemd`.

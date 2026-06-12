@@ -40,7 +40,8 @@
     "update": "node scripts/update.mjs",
     "daemon": "tsc && node ./bin/nbsync.mjs daemon",
     "install:systemd": "node ./scripts/install-systemd.mjs install",
-    "uninstall:systemd": "node ./scripts/install-systemd.mjs uninstall"
+    "uninstall:systemd": "node ./scripts/install-systemd.mjs uninstall",
+    "daemon:update": "node ./scripts/deploy-daemon.mjs"
   },
   "license": "MIT",
   "engines": {
