@@ -28,7 +28,13 @@ function lsRemoteHead(repo) {
 }
 
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
-const re = /^github:nearbytes\/([^#]+)#/;
+// Two pin styles are both in live use: the original `github:owner/repo#sha`
+// shorthand, and `https://github.com/owner/repo.git#commit=sha` (introduced
+// by b3c32ae without updating this script, which silently stopped bumping
+// anything as a result). Match both and preserve whichever style a given
+// dependency already uses.
+const shortRe = /^github:nearbytes\/([^#]+)#(.+)$/;
+const httpsRe = /^https:\/\/github\.com\/nearbytes\/([^/]+)\.git#commit=(.+)$/;
 let touched = false;
 
 for (const section of ['dependencies', 'devDependencies']) {
@@ -36,14 +42,24 @@ for (const section of ['dependencies', 'devDependencies']) {
   if (!deps) continue;
   for (const [name, spec] of Object.entries(deps)) {
     if (typeof spec !== 'string') continue;
-    const m = re.exec(spec);
-    if (!m) continue;
-    const repo = m[1];
+    let m = shortRe.exec(spec);
+    let repo, prevSha, format;
+    if (m) {
+      [, repo, prevSha] = m;
+      format = 'short';
+    } else if ((m = httpsRe.exec(spec))) {
+      [, repo, prevSha] = m;
+      format = 'https';
+    } else {
+      continue;
+    }
     const sha = lsRemoteHead(repo);
-    const next = `github:nearbytes/${repo}#${sha}`;
+    const next =
+      format === 'short'
+        ? `github:nearbytes/${repo}#${sha}`
+        : `https://github.com/nearbytes/${repo}.git#commit=${sha}`;
     if (deps[name] !== next) {
-      const prev = spec.split('#')[1] ?? '?';
-      console.log(`${name.padEnd(24)} ${prev.slice(0, 7)} -> ${sha.slice(0, 7)}`);
+      console.log(`${name.padEnd(24)} ${prevSha.slice(0, 7)} -> ${sha.slice(0, 7)}`);
       deps[name] = next;
       touched = true;
     } else {
