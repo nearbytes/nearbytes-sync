@@ -2,6 +2,7 @@ export {
   start,
   peekInstancePublicKey,
   peekNodeId,
+  assertSyncModuleIdentity,
   type SyncHandle,
   type SyncSnapshot,
   type ConnectedPeer,
@@ -37,7 +38,12 @@ export {
   syncDebugLine,
   isSyncVerboseDebugEnabled,
   formatSyncTimestamp,
+  resolveTraceEmit,
+  MODULE_ID,
   type SyncDebugSink,
+  type SyncDebugLevel,
+  type TraceEmit,
+  type TraceDestination,
 } from '../syncDebugLog.js';
 export {
   configureSyncTimeline,

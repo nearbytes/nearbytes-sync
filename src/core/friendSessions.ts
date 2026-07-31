@@ -1,7 +1,7 @@
 import type { Log } from 'nearbytes-log';
 import { attachPeerSession, type AttachPeerSessionOptions, type DuplexPeer } from './peerLoop.js';
 import { profileSubject } from './topic.js';
-import { syncDebugLine } from '../syncDebugLog.js';
+import { syncDebugLine, type TraceEmit } from '../syncDebugLog.js';
 import type { PeerSessionEventEmitter, SyncEventBus } from './syncEvents.js';
 
 export interface FriendSessionEntry {
@@ -70,7 +70,15 @@ export class FriendSessionRegistry {
    * in-memory `SyncHandle.onEvent` listeners and the daemon beacon
    * publisher from a single source.
    */
-  constructor(private readonly bus?: SyncEventBus) {}
+  /** Trace emitter threaded by reference from `StartOptions.trace` (TRACE-04). Defaults to the legacy global sink. */
+  private readonly trace: TraceEmit;
+
+  constructor(
+    private readonly bus?: SyncEventBus,
+    trace?: TraceEmit,
+  ) {
+    this.trace = trace ?? syncDebugLine;
+  }
 
   /**
    * Count of currently-alive sibling/friend sessions. Used by `SyncSnapshot`
@@ -167,24 +175,25 @@ export class FriendSessionRegistry {
         const existingTier = transportPreference(existing.transportLabel);
         const newTier = transportPreference(transportLabel);
         if (newTier > existingTier) {
-          syncDebugLine('wire', `session reject worse duplicate ${transportLabel}`);
+          this.trace('wire', 'debug', `session reject worse duplicate ${transportLabel}`);
           peer.close();
           return { entry: existing, created: false };
         }
         if (newTier === existingTier) {
           // Never replace a live same-tier leg: a duplicate mdns accept while an
           // outbound dial is in flight used to ECONNRESET mid `want`/`data`.
-          syncDebugLine('wire', `session reject same-tier duplicate ${transportLabel}`);
+          this.trace('wire', 'debug', `session reject same-tier duplicate ${transportLabel}`);
           peer.close();
           return { entry: existing, created: false };
         }
         if (preferKeepExistingSession(existing.locallyInitiated, locallyInitiated)) {
-          syncDebugLine('wire', `session reject duplicate ${transportLabel}`);
+          this.trace('wire', 'debug', `session reject duplicate ${transportLabel}`);
           peer.close();
           return { entry: existing, created: false };
         }
-        syncDebugLine(
+        this.trace(
           'wire',
+          'info',
           `session replace ${existing.transportLabel} -> ${transportLabel}`,
         );
         existing.stop();
@@ -206,6 +215,7 @@ export class FriendSessionRegistry {
       localAssoc !== '' && localAssoc === remote ? 'sibling' : 'friend';
     const optionsWithEvents: AttachPeerSessionOptions = {
       ...sessionOptions,
+      trace: sessionOptions.trace ?? this.trace,
       sessionConnectedAt: connectedAt,
       ...(sessionEmitter !== undefined ? { events: sessionEmitter } : {}),
       ...(this.bus !== undefined

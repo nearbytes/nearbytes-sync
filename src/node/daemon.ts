@@ -40,6 +40,7 @@ import {
   type ReceptionObjectRef,
 } from 'nearbytes-log';
 import { start, type DiscoveryTransport, type SyncHandle } from './start.js';
+import { MODULE_ID } from '../syncDebugLog.js';
 import {
   configsEquivalent,
   readDaemonConfig,
@@ -129,6 +130,7 @@ async function startSyncFromConfig(log: Log, config: SyncDaemonConfig): Promise<
 
 function inertHandle(): SyncHandle {
   return {
+    moduleId: MODULE_ID,
     friends: [],
     serveProfilePublicKeys: [],
     instancePublicKey: '',

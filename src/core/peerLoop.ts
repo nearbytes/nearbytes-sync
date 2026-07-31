@@ -27,7 +27,7 @@ import {
 import type { ObjectRef, Subject, SyncMessage } from './types.js';
 import { appendBenchMarker } from '../benchMarker.js';
 import { logSyncError } from '../logSyncError.js';
-import { syncDebugLine } from '../syncDebugLog.js';
+import { syncDebugLine, type TraceEmit } from '../syncDebugLog.js';
 import { syncTimelineMark } from '../syncTimeline.js';
 import {
   broadcastLocalHave,
@@ -127,6 +127,8 @@ export interface AttachPeerSessionOptions {
   readonly onSessionStall?: (reason: StallReason) => void;
   /** Epoch ms when the association became live (for session rotation). */
   readonly sessionConnectedAt?: number;
+  /** Trace emitter threaded by reference from `StartOptions.trace` (TRACE-04). Defaults to the legacy global sink. */
+  readonly trace?: TraceEmit;
 }
 
 function isMissingLocalObjectError(err: unknown): boolean {
@@ -390,6 +392,7 @@ export function attachPeerSession(
   onPeerClose?: () => void,
   options: AttachPeerSessionOptions = {},
 ): () => void {
+  const trace = options.trace ?? syncDebugLine;
   const storageRoot = options.blockStorageRoot;
   const diskBlockStream = options.diskBlockStream;
   const sessionEvents: PeerSessionEventEmitter =
@@ -533,8 +536,9 @@ export function attachPeerSession(
       }
     }
     if (skippedUnavailable > 0) {
-      syncDebugLine(
+      trace(
         'wire',
+        'warn',
         `have filter skipped ${skippedUnavailable}/${refs.length} reception ref(s) not on disk`,
       );
     }
@@ -549,8 +553,9 @@ export function attachPeerSession(
           `[nearbytes-sync] have → dropped all ${refs.length} ref(s) (skippedUnavailable=${skippedUnavailable})`,
         );
       }
-      syncDebugLine(
+      trace(
         'wire',
+        'warn',
         `have → page had ${refs.length} journal ref(s) but none are locally available`,
       );
       if (more && nextCursor !== undefined) {
@@ -574,8 +579,9 @@ export function attachPeerSession(
       },
       urgent,
     );
-    syncDebugLine(
+    trace(
       'wire',
+      'debug',
       `have → objects=${objects.length} more=${more}` +
         (effectiveNext !== undefined ? ` next=${effectiveNext}` : '') +
         (process.env.NBF_PROP_TRACE === '1'
@@ -585,7 +591,7 @@ export function attachPeerSession(
   };
 
   const requestGlobalDelta = (cursor?: string, urgent = false): void => {
-    syncDebugLine('wire', `delta → global cursor=${cursor ?? 'start'}`);
+    trace('wire', 'debug', `delta → global cursor=${cursor ?? 'start'}`);
     send(buildResumeDelta(subject, cursor), urgent);
   };
 
@@ -600,7 +606,7 @@ export function attachPeerSession(
       syncTimelineMark(tl, 'want→', `blocks=${blocks.length} events=${events.length}`);
     }
     if (blocks.length > 0) {
-      syncDebugLine('wire', `want → blocks=${blocks.length}`);
+      trace('wire', 'debug', `want → blocks=${blocks.length}`);
       for (const ref of blocks) {
         if (ref.kind === 'block') {
           stallGuard?.armWant(ref.hash);
@@ -609,7 +615,7 @@ export function attachPeerSession(
       send({ type: 'want', objects: blocks });
     }
     if (events.length > 0) {
-      syncDebugLine('wire', `want → events=${events.length}`);
+      trace('wire', 'debug', `want → events=${events.length}`);
       send({ type: 'want', objects: events });
     }
   };
@@ -693,7 +699,7 @@ export function attachPeerSession(
   ): Promise<void> => {
     const key = resumeCursorKey(cursor);
     if (lastResumeRespondedKey === key) {
-      syncDebugLine('wire', `delta ← deduped cursor=${cursor ?? 'start'}`);
+      trace('wire', 'trace', `delta ← deduped cursor=${cursor ?? 'start'}`);
       return;
     }
     lastResumeRespondedKey = key;
@@ -707,8 +713,9 @@ export function attachPeerSession(
     }
     const pageKey = resumeCursorKey(msg.fromCursor === '' ? undefined : msg.fromCursor);
     if (resumeWalkInFlight !== undefined && pageKey !== resumeWalkInFlight) {
-      syncDebugLine(
+      trace(
         'wire',
+        'trace',
         `have ← resume page cursor=${msg.fromCursor} ignored (inFlight=${resumeWalkInFlight})`,
       );
       return;
@@ -728,7 +735,7 @@ export function attachPeerSession(
         const localMax = await readLocalReceptionMaxSeq(storageRoot);
         if (!resumeWalkRewound && !Number.isNaN(initialNum) && initialNum > localMax) {
           resumeWalkRewound = true;
-          syncDebugLine('wire', 'resume ← empty at stale cursor — paginate from start');
+          trace('wire', 'info', 'resume ← empty at stale cursor — paginate from start');
           requestResumeWalkPage(undefined);
           return;
         }
@@ -783,16 +790,17 @@ export function attachPeerSession(
   const runAttachSync = (): void => {
     const resumeCursor = options.initialFetchCursor;
     const tl = options.timelineKey;
-    syncDebugLine('wire', `attach → resume remote cursor=${resumeCursor ?? 'start'}`);
+    trace('wire', 'info', `attach → resume remote cursor=${resumeCursor ?? 'start'}`);
     if (tl !== undefined) {
       syncTimelineMark(tl, 'resume-sent', `cursor=${resumeCursor ?? 'start'}`);
     }
     requestResumeWalkPage(resumeCursor);
+    trace('wire', 'info', `subscribe → cursor=${resumeCursor ?? 'start'}`);
     send(buildResumeSubscribe(subject, resumeCursor), true);
     void (async () => {
       const out = await listLocalReceptionForConnect(log, storageRoot);
       if (out.refs.length > 0) {
-        syncDebugLine('wire', `attach → announce local objects=${out.refs.length}`);
+        trace('wire', 'info', `attach → announce local objects=${out.refs.length}`);
         if (tl !== undefined) {
           syncTimelineMark(tl, 'announce-sent', `objects=${out.refs.length}`);
         }
@@ -814,6 +822,7 @@ export function attachPeerSession(
 
   const onMessage = async (msg: SyncMessage): Promise<void> => {
     if (msg.type === 'hello') {
+      trace('wire', 'trace', 'hello ← stray post-handshake hello frame ignored');
       return;
     }
 
@@ -823,6 +832,11 @@ export function attachPeerSession(
     }
 
     if (msg.type === 'subscribe' && msg.delta.mode === 'global') {
+      trace(
+        'wire',
+        'info',
+        `subscribe ← cursor=${msg.delta.cursor ?? 'start'}`,
+      );
       await respondToGlobalResume(msg.delta.cursor, msg.delta.limit ?? RECEPTION_RESUME_PAGE);
       return;
     }
@@ -839,8 +853,9 @@ export function attachPeerSession(
             (resumePage ? ` from=${msg.fromCursor === '' ? 'start' : msg.fromCursor}` : ''),
         );
       }
-      syncDebugLine(
+      trace(
         'wire',
+        'debug',
         `have ← objects=${msg.objects.length} more=${msg.more}` +
           (msg.nextCursor !== undefined ? ` next=${msg.nextCursor}` : '') +
           (resumePage ? ` from=${msg.fromCursor === '' ? 'start' : msg.fromCursor}` : ' push'),
@@ -851,8 +866,9 @@ export function attachPeerSession(
     }
 
     if (msg.type === 'want') {
-      syncDebugLine(
+      trace(
         'wire',
+        'debug',
         `want ← blocks=${msg.objects.filter((o) => o.kind === 'block').length} events=${msg.objects.filter((o) => o.kind === 'event').length}`,
       );
       const { blocks, events } = partitionWantRefs(msg.objects);
@@ -873,8 +889,9 @@ export function attachPeerSession(
         blockServed += 1;
         sendBlockStream(log, runOutbound, peer, storageRoot, ref, null, 0, sessionEvents, stallGuard);
       }
-      syncDebugLine(
+      trace(
         'wire',
+        blockMissingLocal > 0 ? 'warn' : 'debug',
         `want ← blocks=${blocks.length} events=${events.length}` +
           (blocks.length > 0
             ? ` served=${blockServed} missing-local=${blockMissingLocal}`

@@ -2,6 +2,7 @@ import { randomBytes } from 'crypto';
 import type { DuplexPeer } from './peerLoop.js';
 import { createFrameDecoder, encodeFrame } from './codec.js';
 import type { Subject, SyncMessage } from './types.js';
+import { syncDebugLine, type TraceEmit } from '../syncDebugLog.js';
 
 const PROTOCOL = 'nearbytes.sync.v1' as const;
 
@@ -43,6 +44,8 @@ export interface FriendHandshakeOptions {
    */
   readonly allowedRemoteProfiles: ReadonlySet<string>;
   readonly timeoutMs?: number;
+  /** Trace emitter threaded by reference from `StartOptions.trace` (TRACE-04). Defaults to the legacy global sink. */
+  readonly trace?: TraceEmit;
 }
 
 export interface FriendHandshakeResult {
@@ -66,6 +69,7 @@ export function exchangeFriendHandshake(
   peer: DuplexPeer,
   options: FriendHandshakeOptions,
 ): Promise<FriendHandshakeResult> {
+  const trace = options.trace ?? syncDebugLine;
   const localProfile = options.localProfilePublicKey.toLowerCase();
   const localPeerId = options.localPeerId.toLowerCase();
   const localInstancePublicKey = options.localInstancePublicKey.toLowerCase();
@@ -80,6 +84,7 @@ export function exchangeFriendHandshake(
     const timeout = setTimeout(() => {
       stopHandshakeData?.();
       peer.close();
+      trace('wire', 'warn', 'hello ← timed out waiting for remote hello');
       reject(new SyncHandshakeError('timeout', 'sync handshake timed out', true));
     }, options.timeoutMs ?? 15_000);
 
@@ -111,6 +116,7 @@ export function exchangeFriendHandshake(
       };
       peer.write(encodeFrame(hello));
       localHelloSent = true;
+      trace('wire', 'info', `hello → subject=${JSON.stringify(options.subject)}`);
       tryComplete();
     };
 
@@ -123,6 +129,7 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
+        trace('wire', 'warn', `hello ← rejected: unsupported protocol ${msg.protocol}`);
         reject(
           new SyncHandshakeError(
             'unsupported-protocol',
@@ -136,6 +143,7 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
+        trace('wire', 'warn', 'hello ← rejected: duplicate sessionNonce');
         reject(
           new SyncHandshakeError(
             'duplicate-nonce',
@@ -152,6 +160,11 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
+        trace(
+          'wire',
+          'warn',
+          `hello ← rejected: unauthorized profile ${remote ?? '(none)'}`,
+        );
         reject(
           new SyncHandshakeError(
             'unauthorized-profile',
@@ -166,6 +179,7 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
+        trace('wire', 'warn', 'hello ← rejected: no peer id advertised');
         reject(
           new SyncHandshakeError(
             'unauthorized-profile',
@@ -180,6 +194,7 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
+        trace('wire', 'warn', 'hello ← rejected: no instance identity advertised');
         reject(
           new SyncHandshakeError(
             'unauthorized-profile',
@@ -193,6 +208,7 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
+        trace('wire', 'warn', 'hello ← rejected: instance-level loopback');
         reject(
           new SyncHandshakeError(
             'instance-loopback',
@@ -202,6 +218,11 @@ export function exchangeFriendHandshake(
         );
         return;
       }
+      trace(
+        'wire',
+        'info',
+        `hello ← accepted profile=${remote.slice(0, 12)} inst=${remoteInstancePublicKey.slice(0, 8)}`,
+      );
       remoteResult = {
         remoteProfile: remote,
         remotePeerId,

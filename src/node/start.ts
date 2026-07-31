@@ -6,7 +6,12 @@ import { connectDiscoveredPeer } from './connect.js';
 import { createHyperswarmDiscovery } from './discovery/hyperswarm.js';
 import { createMdnsDiscovery } from './discovery/mdns.js';
 import { appendBenchMarker } from '../benchMarker.js';
-import { syncDebugLine } from '../syncDebugLog.js';
+import {
+  MODULE_ID,
+  resolveTraceEmit,
+  syncDebugLine,
+  type TraceDestination,
+} from '../syncDebugLog.js';
 import {
   isSyncTimelineEnabled,
   syncTimelineBeginSession,
@@ -57,6 +62,16 @@ export interface StartOptions {
    * `mdns` = LAN TCP only, `dht`/`hyperswarm` = Hyperswarm only, `all` = both.
    */
   readonly discoveryTransport?: DiscoveryTransport;
+  /**
+   * Trace destination installed **by reference** (TRACE-04) and threaded
+   * down into every layer (handshake, peer-loop, session registry) for this
+   * engine instance specifically — no module-global mutation required. Hold
+   * onto the same object and toggle `.sink` to enable/disable at runtime
+   * without restarting the engine (TRACE-01). Omit entirely to fall back to
+   * the legacy `configureSyncDebug` global (kept only for pre-existing
+   * consumers such as `nbf --debug`).
+   */
+  readonly trace?: TraceDestination;
 }
 
 export type DiscoveryTransport = 'mdns' | 'dht' | 'hyperswarm' | 'all';
@@ -114,6 +129,16 @@ export interface ConnectedPeer {
 }
 
 export interface SyncHandle {
+  /**
+   * Identity of the specific loaded copy of `nearbytes-sync` that produced
+   * this handle (TRACE-05). A consumer that installs a trace sink via
+   * `StartOptions.trace` MUST compare its own imported `MODULE_ID` against
+   * this value — see {@link assertSyncModuleIdentity} — to detect the case
+   * where duplicate package copies (e.g. hoisted vs. nested under a stale
+   * transitive pin) mean the sink was wired to a module instance nothing
+   * on the live wire path actually uses.
+   */
+  readonly moduleId: string;
   readonly friends: readonly string[];
   readonly serveProfilePublicKeys: readonly string[];
   /**
@@ -216,6 +241,30 @@ export function peekNodeId(dataDir: string): string {
 
 export { peekInstancePublicKey };
 
+/**
+ * Verify TRACE-06: throws if the `moduleId` on a live `SyncHandle` does not
+ * match the `moduleId` of the copy of `nearbytes-sync` the caller itself
+ * imported (`MODULE_ID` from `../syncDebugLog.js`, re-exported alongside
+ * this function). A mismatch means a trace sink installed by the caller's
+ * copy would never see frames emitted by the handle's copy — the exact
+ * duplicate-package failure mode `sync-tracing-v1.md` §1 exists to make
+ * loud instead of silent.
+ */
+export function assertSyncModuleIdentity(
+  callerModuleId: string,
+  handle: Pick<SyncHandle, 'moduleId'>,
+): void {
+  if (callerModuleId !== handle.moduleId) {
+    throw new Error(
+      `nearbytes-sync module identity mismatch: caller is module instance ` +
+        `${callerModuleId}, but the live SyncHandle was produced by ${handle.moduleId}. ` +
+        `This means two physical copies of nearbytes-sync are loaded (check for a ` +
+        `stale transitive pin preventing yarn from deduping node_modules) and a ` +
+        `trace sink installed against the caller's copy would silently receive no frames.`,
+    );
+  }
+}
+
 export async function start(
   log: Log,
   friends: readonly string[],
@@ -274,6 +323,7 @@ export async function start(
   // discover and sync with each other without any friend setup.
   if (topics.length === 0) {
     return {
+      moduleId: MODULE_ID,
       friends,
       serveProfilePublicKeys: [...servedSet],
       instancePublicKey: '',
@@ -437,7 +487,8 @@ export async function start(
     });
   }
 
-  const friendSessions = new FriendSessionRegistry(eventBus);
+  const traceEmit = resolveTraceEmit(options.trace);
+  const friendSessions = new FriendSessionRegistry(eventBus, traceEmit);
   if (mdnsBackend?.forgetTcpPeer) {
     const forgetTcpPeer = mdnsBackend.forgetTcpPeer.bind(mdnsBackend);
     eventBus.onEvent((e) => {
@@ -520,6 +571,7 @@ export async function start(
           allowedRemoteProfiles: authorizedRemoteProfiles,
           timeoutMs:
             discovered.transport === 'duplex' ? DHT_HANDSHAKE_TIMEOUT_MS : undefined,
+          trace: traceEmit,
         });
         remoteProfileHint = remoteProfile;
         timelineKey = syncTimelineHandoff(timelineLabelKey, remoteProfile, remoteInstancePublicKey);
@@ -539,6 +591,7 @@ export async function start(
           if (friendSessions.hasAliveSession(remoteProfile, remoteInstancePublicKey)) {
             syncDebugLine(
               'wire',
+              'debug',
               `duplicate connect dropped remote=${remoteProfile.slice(0, 12)} inst=${remoteInstancePublicKey.slice(0, 8)}`,
             );
             duplex.close();
@@ -734,6 +787,7 @@ export async function start(
       : inflightBlockRegistry(log);
   const outbound = outboundBlockStreamCounter(log);
   return {
+    moduleId: MODULE_ID,
     friends,
     serveProfilePublicKeys: [...servedSet],
     instancePublicKey,
