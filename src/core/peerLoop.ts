@@ -27,7 +27,9 @@ import {
 import type { ObjectRef, Subject, SyncMessage } from './types.js';
 import { appendBenchMarker } from '../benchMarker.js';
 import { logSyncError } from '../logSyncError.js';
-import { syncDebugLine, type TraceEmit } from '../syncDebugLog.js';
+import { resolveTraceEmit, type TraceEmit, type WireFrameInput } from '../syncDebugLog.js';
+
+const defaultTrace = resolveTraceEmit();
 import { syncTimelineMark } from '../syncTimeline.js';
 import {
   broadcastLocalHave,
@@ -129,6 +131,12 @@ export interface AttachPeerSessionOptions {
   readonly sessionConnectedAt?: number;
   /** Trace emitter threaded by reference from `StartOptions.trace` (TRACE-04). Defaults to the legacy global sink. */
   readonly trace?: TraceEmit;
+  /** Association identity for trace frames (TRACE-12/13/16) — set by `FriendSessionRegistry.attach`. */
+  readonly localProfile?: string;
+  readonly remoteProfile?: string;
+  readonly remoteInstance?: string;
+  readonly assoc?: string;
+  readonly transport?: string;
 }
 
 function isMissingLocalObjectError(err: unknown): boolean {
@@ -392,7 +400,22 @@ export function attachPeerSession(
   onPeerClose?: () => void,
   options: AttachPeerSessionOptions = {},
 ): () => void {
-  const trace = options.trace ?? syncDebugLine;
+  const trace = options.trace ?? defaultTrace;
+  // Association identity (TRACE-12/13/16) is the same for every frame this
+  // session emits — attach it once here instead of repeating it at each
+  // call site below.
+  const emit = (
+    frame: Omit<WireFrameInput, 'localProfile' | 'remoteProfile' | 'remoteInstance' | 'assoc' | 'transport'>,
+  ): void => {
+    trace({
+      localProfile: options.localProfile,
+      remoteProfile: options.remoteProfile,
+      remoteInstance: options.remoteInstance,
+      assoc: options.assoc,
+      transport: options.transport,
+      ...frame,
+    });
+  };
   const storageRoot = options.blockStorageRoot;
   const diskBlockStream = options.diskBlockStream;
   const sessionEvents: PeerSessionEventEmitter =
@@ -536,11 +559,11 @@ export function attachPeerSession(
       }
     }
     if (skippedUnavailable > 0) {
-      trace(
-        'wire',
-        'warn',
-        `have filter skipped ${skippedUnavailable}/${refs.length} reception ref(s) not on disk`,
-      );
+      emit({
+        layer: 'anti-entropy', level: 'warn', dir: 'local', msg: 'have',
+        corrId: fromCursor, corrKind: 'cursor',
+        data: { reason: 'refs-unavailable', skipped: skippedUnavailable, total: refs.length },
+      });
     }
     if (process.env.NBF_PROP_TRACE === '1') {
       console.error(
@@ -553,11 +576,11 @@ export function attachPeerSession(
           `[nearbytes-sync] have → dropped all ${refs.length} ref(s) (skippedUnavailable=${skippedUnavailable})`,
         );
       }
-      trace(
-        'wire',
-        'warn',
-        `have → page had ${refs.length} journal ref(s) but none are locally available`,
-      );
+      emit({
+        layer: 'anti-entropy', level: 'warn', dir: 'out', msg: 'have',
+        corrId: fromCursor, corrKind: 'cursor',
+        data: { reason: 'all-refs-unavailable', total: refs.length },
+      });
       if (more && nextCursor !== undefined) {
         send(
           { type: 'have', subject, objects: [], more: true, nextCursor, ...fromCursorField },
@@ -579,19 +602,23 @@ export function attachPeerSession(
       },
       urgent,
     );
-    trace(
-      'wire',
-      'debug',
-      `have → objects=${objects.length} more=${more}` +
-        (effectiveNext !== undefined ? ` next=${effectiveNext}` : '') +
-        (process.env.NBF_PROP_TRACE === '1'
-          ? ` kinds=${objects.map((o) => o.kind).join(',')}`
-          : ''),
-    );
+    emit({
+      layer: 'anti-entropy', level: 'debug', dir: 'out', msg: 'have',
+      corrId: fromCursor, corrKind: 'cursor',
+      data: {
+        objects: objects.length,
+        more,
+        ...(effectiveNext !== undefined ? { nextCursor: effectiveNext } : {}),
+        hashes: objects.map((o) => o.hash),
+      },
+    });
   };
 
   const requestGlobalDelta = (cursor?: string, urgent = false): void => {
-    trace('wire', 'debug', `delta → global cursor=${cursor ?? 'start'}`);
+    emit({
+      layer: 'anti-entropy', level: 'debug', dir: 'out', msg: 'delta',
+      corrId: cursor, corrKind: 'cursor', data: { cursor: cursor ?? 'start', mode: 'global' },
+    });
     send(buildResumeDelta(subject, cursor), urgent);
   };
 
@@ -606,16 +633,29 @@ export function attachPeerSession(
       syncTimelineMark(tl, 'want→', `blocks=${blocks.length} events=${events.length}`);
     }
     if (blocks.length > 0) {
-      trace('wire', 'debug', `want → blocks=${blocks.length}`);
+      emit({
+        layer: 'anti-entropy', level: 'debug', dir: 'out', msg: 'want',
+        data: { blocks: blocks.length, hashes: blocks.map((r) => r.hash) },
+      });
       for (const ref of blocks) {
         if (ref.kind === 'block') {
           stallGuard?.armWant(ref.hash);
+          // TRACE-20 (block layer): the want is now outstanding. Pairs with
+          // want-satisfied / want-timeout on the same `hash` corrId, which is
+          // what makes a never-answered want visible instead of merely absent.
+          emit({
+            layer: 'block', level: 'debug', dir: 'local', msg: 'want-armed',
+            corrId: ref.hash, corrKind: 'hash', data: { hash: ref.hash },
+          });
         }
       }
       send({ type: 'want', objects: blocks });
     }
     if (events.length > 0) {
-      trace('wire', 'debug', `want → events=${events.length}`);
+      emit({
+        layer: 'anti-entropy', level: 'debug', dir: 'out', msg: 'want',
+        data: { events: events.length, hashes: events.map((r) => r.hash) },
+      });
       send({ type: 'want', objects: events });
     }
   };
@@ -699,7 +739,10 @@ export function attachPeerSession(
   ): Promise<void> => {
     const key = resumeCursorKey(cursor);
     if (lastResumeRespondedKey === key) {
-      trace('wire', 'trace', `delta ← deduped cursor=${cursor ?? 'start'}`);
+      emit({
+        layer: 'anti-entropy', level: 'trace', dir: 'in', msg: 'delta',
+        corrId: key, corrKind: 'cursor', data: { reason: 'deduped', cursor: cursor ?? 'start' },
+      });
       return;
     }
     lastResumeRespondedKey = key;
@@ -713,11 +756,11 @@ export function attachPeerSession(
     }
     const pageKey = resumeCursorKey(msg.fromCursor === '' ? undefined : msg.fromCursor);
     if (resumeWalkInFlight !== undefined && pageKey !== resumeWalkInFlight) {
-      trace(
-        'wire',
-        'trace',
-        `have ← resume page cursor=${msg.fromCursor} ignored (inFlight=${resumeWalkInFlight})`,
-      );
+      emit({
+        layer: 'anti-entropy', level: 'trace', dir: 'in', msg: 'have',
+        corrId: msg.fromCursor, corrKind: 'cursor',
+        data: { reason: 'stale-resume-page', inFlight: resumeWalkInFlight },
+      });
       return;
     }
     resumeWalkInFlight = undefined;
@@ -735,7 +778,10 @@ export function attachPeerSession(
         const localMax = await readLocalReceptionMaxSeq(storageRoot);
         if (!resumeWalkRewound && !Number.isNaN(initialNum) && initialNum > localMax) {
           resumeWalkRewound = true;
-          trace('wire', 'info', 'resume ← empty at stale cursor — paginate from start');
+          emit({
+            layer: 'anti-entropy', level: 'info', dir: 'in', msg: 'resume',
+            data: { reason: 'stale-cursor-rewind', initialCursor: initial },
+          });
           requestResumeWalkPage(undefined);
           return;
         }
@@ -790,17 +836,26 @@ export function attachPeerSession(
   const runAttachSync = (): void => {
     const resumeCursor = options.initialFetchCursor;
     const tl = options.timelineKey;
-    trace('wire', 'info', `attach → resume remote cursor=${resumeCursor ?? 'start'}`);
+    emit({
+      layer: 'anti-entropy', level: 'info', dir: 'out', msg: 'attach',
+      corrId: resumeCursor, corrKind: 'cursor', data: { phase: 'resume', cursor: resumeCursor ?? 'start' },
+    });
     if (tl !== undefined) {
       syncTimelineMark(tl, 'resume-sent', `cursor=${resumeCursor ?? 'start'}`);
     }
     requestResumeWalkPage(resumeCursor);
-    trace('wire', 'info', `subscribe → cursor=${resumeCursor ?? 'start'}`);
+    emit({
+      layer: 'anti-entropy', level: 'info', dir: 'out', msg: 'subscribe',
+      corrId: resumeCursor, corrKind: 'cursor', data: { cursor: resumeCursor ?? 'start' },
+    });
     send(buildResumeSubscribe(subject, resumeCursor), true);
     void (async () => {
       const out = await listLocalReceptionForConnect(log, storageRoot);
       if (out.refs.length > 0) {
-        trace('wire', 'info', `attach → announce local objects=${out.refs.length}`);
+        emit({
+          layer: 'anti-entropy', level: 'info', dir: 'out', msg: 'attach',
+          data: { phase: 'announce', objects: out.refs.length },
+        });
         if (tl !== undefined) {
           syncTimelineMark(tl, 'announce-sent', `objects=${out.refs.length}`);
         }
@@ -822,7 +877,10 @@ export function attachPeerSession(
 
   const onMessage = async (msg: SyncMessage): Promise<void> => {
     if (msg.type === 'hello') {
-      trace('wire', 'trace', 'hello ← stray post-handshake hello frame ignored');
+      emit({
+        layer: 'handshake', level: 'trace', dir: 'in', msg: 'hello',
+        data: { reason: 'stray-post-handshake', suppressed: true },
+      });
       return;
     }
 
@@ -832,11 +890,10 @@ export function attachPeerSession(
     }
 
     if (msg.type === 'subscribe' && msg.delta.mode === 'global') {
-      trace(
-        'wire',
-        'info',
-        `subscribe ← cursor=${msg.delta.cursor ?? 'start'}`,
-      );
+      emit({
+        layer: 'anti-entropy', level: 'info', dir: 'in', msg: 'subscribe',
+        corrId: msg.delta.cursor, corrKind: 'cursor', data: { cursor: msg.delta.cursor ?? 'start' },
+      });
       await respondToGlobalResume(msg.delta.cursor, msg.delta.limit ?? RECEPTION_RESUME_PAGE);
       return;
     }
@@ -853,24 +910,33 @@ export function attachPeerSession(
             (resumePage ? ` from=${msg.fromCursor === '' ? 'start' : msg.fromCursor}` : ''),
         );
       }
-      trace(
-        'wire',
-        'debug',
-        `have ← objects=${msg.objects.length} more=${msg.more}` +
-          (msg.nextCursor !== undefined ? ` next=${msg.nextCursor}` : '') +
-          (resumePage ? ` from=${msg.fromCursor === '' ? 'start' : msg.fromCursor}` : ' push'),
-      );
+      emit({
+        layer: 'anti-entropy', level: 'debug', dir: 'in', msg: 'have',
+        corrId: resumePage ? msg.fromCursor : undefined, corrKind: 'cursor',
+        data: {
+          objects: msg.objects.length,
+          more: msg.more,
+          ...(msg.nextCursor !== undefined ? { nextCursor: msg.nextCursor } : {}),
+          push: !resumePage,
+          hashes: msg.objects.map((o) => o.hash),
+        },
+      });
       onResumeWalkHave(msg);
       await processHaveWants(msg);
       return;
     }
 
     if (msg.type === 'want') {
-      trace(
-        'wire',
-        'debug',
-        `want ← blocks=${msg.objects.filter((o) => o.kind === 'block').length} events=${msg.objects.filter((o) => o.kind === 'event').length}`,
-      );
+      const wantBlocks = msg.objects.filter((o) => o.kind === 'block');
+      const wantEvents = msg.objects.filter((o) => o.kind === 'event');
+      emit({
+        layer: 'anti-entropy', level: 'debug', dir: 'in', msg: 'want',
+        data: {
+          blocks: wantBlocks.length,
+          events: wantEvents.length,
+          hashes: msg.objects.map((o) => o.hash),
+        },
+      });
       const { blocks, events } = partitionWantRefs(msg.objects);
       let blockServed = 0;
       let blockMissingLocal = 0;
@@ -889,14 +955,14 @@ export function attachPeerSession(
         blockServed += 1;
         sendBlockStream(log, runOutbound, peer, storageRoot, ref, null, 0, sessionEvents, stallGuard);
       }
-      trace(
-        'wire',
-        blockMissingLocal > 0 ? 'warn' : 'debug',
-        `want ← blocks=${blocks.length} events=${events.length}` +
-          (blocks.length > 0
-            ? ` served=${blockServed} missing-local=${blockMissingLocal}`
-            : ''),
-      );
+      emit({
+        layer: 'block', level: blockMissingLocal > 0 ? 'warn' : 'debug', dir: 'local', msg: 'want-satisfied',
+        data: {
+          blocks: blocks.length,
+          events: events.length,
+          ...(blocks.length > 0 ? { served: blockServed, missingLocal: blockMissingLocal } : {}),
+        },
+      });
       for (const ref of events) {
         const bytes = await readLocalBytes(log, ref);
         if (bytes) {
@@ -1234,8 +1300,25 @@ export function attachPeerSession(
   };
 
   if (options.onSessionStall !== undefined) {
+    const onStall = options.onSessionStall;
     stallGuard = new SessionStallGuard(
-      options.onSessionStall,
+      (reason) => {
+        // TRACE-20/22 (block layer): why the association is being torn down,
+        // with the outstanding-want count that usually explains it. A
+        // want-timeout with wantsPending > 0 is the deadlock signature.
+        emit({
+          layer: 'block',
+          level: 'warn',
+          dir: 'local',
+          msg: 'want-timeout',
+          data: {
+            reason,
+            wantsPending: claimedHashes.size,
+            hashes: [...claimedHashes],
+          },
+        });
+        onStall(reason);
+      },
       () => ({
         wantsPending: claimedHashes.size,
         streamActive: isInboundBlockStreamActive(),

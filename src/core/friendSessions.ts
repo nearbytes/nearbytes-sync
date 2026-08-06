@@ -1,7 +1,9 @@
 import type { Log } from 'nearbytes-log';
 import { attachPeerSession, type AttachPeerSessionOptions, type DuplexPeer } from './peerLoop.js';
 import { profileSubject } from './topic.js';
-import { syncDebugLine, type TraceEmit } from '../syncDebugLog.js';
+import { resolveTraceEmit, computeAssocId, type TraceEmit } from '../syncDebugLog.js';
+
+const defaultTrace = resolveTraceEmit();
 import type { PeerSessionEventEmitter, SyncEventBus } from './syncEvents.js';
 
 export interface FriendSessionEntry {
@@ -77,7 +79,7 @@ export class FriendSessionRegistry {
     private readonly bus?: SyncEventBus,
     trace?: TraceEmit,
   ) {
-    this.trace = trace ?? syncDebugLine;
+    this.trace = trace ?? defaultTrace;
   }
 
   /**
@@ -170,32 +172,45 @@ export class FriendSessionRegistry {
     const remoteInstance = remoteInstancePublicKey.toLowerCase();
     const key = this.sessionKey(remote, remoteInstance);
     const existing = this.sessions.get(key);
+    const assoc = computeAssocId(localAssociationProfile, remote, remoteInstance);
     if (existing !== undefined) {
       if (existing.isAlive()) {
         const existingTier = transportPreference(existing.transportLabel);
         const newTier = transportPreference(transportLabel);
         if (newTier > existingTier) {
-          this.trace('wire', 'debug', `session reject worse duplicate ${transportLabel}`);
+          this.trace({
+            layer: 'session', level: 'debug', dir: 'local', msg: 'session-reject',
+            localProfile: localAssociationProfile, remoteProfile: remote, remoteInstance, assoc,
+            transport: transportLabel, data: { reason: 'worse-duplicate' },
+          });
           peer.close();
           return { entry: existing, created: false };
         }
         if (newTier === existingTier) {
           // Never replace a live same-tier leg: a duplicate mdns accept while an
           // outbound dial is in flight used to ECONNRESET mid `want`/`data`.
-          this.trace('wire', 'debug', `session reject same-tier duplicate ${transportLabel}`);
+          this.trace({
+            layer: 'session', level: 'debug', dir: 'local', msg: 'session-reject',
+            localProfile: localAssociationProfile, remoteProfile: remote, remoteInstance, assoc,
+            transport: transportLabel, data: { reason: 'same-tier-duplicate' },
+          });
           peer.close();
           return { entry: existing, created: false };
         }
         if (preferKeepExistingSession(existing.locallyInitiated, locallyInitiated)) {
-          this.trace('wire', 'debug', `session reject duplicate ${transportLabel}`);
+          this.trace({
+            layer: 'session', level: 'debug', dir: 'local', msg: 'session-reject',
+            localProfile: localAssociationProfile, remoteProfile: remote, remoteInstance, assoc,
+            transport: transportLabel, data: { reason: 'duplicate' },
+          });
           peer.close();
           return { entry: existing, created: false };
         }
-        this.trace(
-          'wire',
-          'info',
-          `session replace ${existing.transportLabel} -> ${transportLabel}`,
-        );
+        this.trace({
+          layer: 'session', level: 'info', dir: 'local', msg: 'session-replace',
+          localProfile: localAssociationProfile, remoteProfile: remote, remoteInstance, assoc,
+          transport: transportLabel, data: { from: existing.transportLabel, to: transportLabel },
+        });
         existing.stop();
         existing.close();
       } else {
@@ -217,6 +232,11 @@ export class FriendSessionRegistry {
       ...sessionOptions,
       trace: sessionOptions.trace ?? this.trace,
       sessionConnectedAt: connectedAt,
+      localProfile: localAssociationProfile.toLowerCase(),
+      remoteProfile: remote,
+      remoteInstance,
+      assoc,
+      transport: transportLabel,
       ...(sessionEmitter !== undefined ? { events: sessionEmitter } : {}),
       ...(this.bus !== undefined
         ? {

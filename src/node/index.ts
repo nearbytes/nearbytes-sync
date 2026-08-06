@@ -39,11 +39,16 @@ export {
   isSyncVerboseDebugEnabled,
   formatSyncTimestamp,
   resolveTraceEmit,
+  computeAssocId,
   MODULE_ID,
   type SyncDebugSink,
   type SyncDebugLevel,
   type TraceEmit,
+  type TraceSink,
   type TraceDestination,
+  type WireLayer,
+  type WireFrameInput,
+  type WireFrame,
 } from '../syncDebugLog.js';
 export {
   configureSyncTimeline,

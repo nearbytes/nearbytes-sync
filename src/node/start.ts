@@ -9,7 +9,7 @@ import { appendBenchMarker } from '../benchMarker.js';
 import {
   MODULE_ID,
   resolveTraceEmit,
-  syncDebugLine,
+  computeAssocId,
   type TraceDestination,
 } from '../syncDebugLog.js';
 import {
@@ -488,6 +488,33 @@ export async function start(
   }
 
   const traceEmit = resolveTraceEmit(options.trace);
+
+  // TRACE-20/23 (config layer). Emitting the *configured* set up front is what
+  // makes "this friend was never contacted" observable: without it, a friend
+  // that discovery never yields is indistinguishable from one that was tried
+  // and failed, because both produce zero frames. Absence of evidence must not
+  // be the only evidence of absence.
+  for (const served of servedSet) {
+    traceEmit({
+      layer: 'config',
+      level: 'info',
+      dir: 'local',
+      msg: 'profile-served',
+      localProfile: served,
+      data: { active: served === activeProfile, topics: topics.length },
+    });
+  }
+  for (const friend of friendSet) {
+    traceEmit({
+      layer: 'config',
+      level: 'info',
+      dir: 'local',
+      msg: 'friend-configured',
+      remoteProfile: friend,
+      data: { sibling: servedSet.has(friend) },
+    });
+  }
+
   const friendSessions = new FriendSessionRegistry(eventBus, traceEmit);
   if (mdnsBackend?.forgetTcpPeer) {
     const forgetTcpPeer = mdnsBackend.forgetTcpPeer.bind(mdnsBackend);
@@ -544,7 +571,30 @@ export async function start(
       let timelineKey = timelineLabelKey;
       try {
         syncTimelineMark(timelineLabelKey, 'connect-start', `attempt=${attempt}`);
+        // TRACE-20/21 (transport layer): both sides of the dial.
+        traceEmit({
+          layer: 'transport',
+          level: 'info',
+          dir: 'out',
+          msg: 'dial-start',
+          transport: discovered.label,
+          localProfile: localProfileForAssoc,
+          ...(remoteProfileHint !== undefined ? { remoteProfile: remoteProfileHint } : {}),
+          data: { attempt, maxAttempts: FRIEND_CONNECT_MAX_ATTEMPTS },
+        });
+        const dialStartedAt = Date.now();
         duplex = await connectDiscoveredPeer(discovered);
+        traceEmit({
+          layer: 'transport',
+          level: 'info',
+          dir: 'in',
+          msg: 'dial-ok',
+          transport: discovered.label,
+          localProfile: localProfileForAssoc,
+          ...(remoteProfileHint !== undefined ? { remoteProfile: remoteProfileHint } : {}),
+          rttMs: Date.now() - dialStartedAt,
+          data: { attempt },
+        });
         syncTimelineMark(timelineLabelKey, 'tcp-connected');
         if (handshakingDuplexes.has(duplex)) {
           return;
@@ -589,11 +639,17 @@ export async function start(
         pairKeyOptimistic = pairKey;
         try {
           if (friendSessions.hasAliveSession(remoteProfile, remoteInstancePublicKey)) {
-            syncDebugLine(
-              'wire',
-              'debug',
-              `duplicate connect dropped remote=${remoteProfile.slice(0, 12)} inst=${remoteInstancePublicKey.slice(0, 8)}`,
-            );
+            traceEmit({
+              layer: 'session',
+              level: 'debug',
+              dir: 'local',
+              msg: 'session-reject',
+              localProfile: localProfileForAssoc,
+              remoteProfile,
+              remoteInstance: remoteInstancePublicKey,
+              assoc: computeAssocId(localProfileForAssoc, remoteProfile, remoteInstancePublicKey),
+              data: { reason: 'duplicate-connect' },
+            });
             duplex.close();
             return;
           }
@@ -675,6 +731,24 @@ export async function start(
         const classified = classifyFriendConnectError(err);
         const canRetry =
           classified.retryable && attempt < FRIEND_CONNECT_MAX_ATTEMPTS;
+        // TRACE-22: machine-readable reason, and whether a retry follows —
+        // so an exhausted-retries failure reads differently from a transient one.
+        traceEmit({
+          layer: 'transport',
+          level: canRetry ? 'warn' : 'error',
+          dir: 'local',
+          msg: 'dial-fail',
+          transport: discovered.label,
+          localProfile: localProfileForAssoc,
+          ...(remoteProfileHint !== undefined ? { remoteProfile: remoteProfileHint } : {}),
+          data: {
+            reason: classified.tag,
+            attempt,
+            maxAttempts: FRIEND_CONNECT_MAX_ATTEMPTS,
+            willRetry: canRetry,
+            retryable: classified.retryable,
+          },
+        });
         if (canRetry) {
           logFriendConnectRetry(
             connectScope,
@@ -717,6 +791,26 @@ export async function start(
   };
 
   discovery.onPeer((discovered) => {
+    // TRACE-20 (discovery layer): a sighting, before any dial is attempted.
+    traceEmit({
+      layer: 'discovery',
+      level: 'debug',
+      dir: 'in',
+      msg: discovered.transport === 'tcp' ? 'mdns-sighting' : 'dht-peer',
+      transport: discovered.label,
+      ...(discovered.profilePublicKey !== undefined
+        ? { remoteProfile: discovered.profilePublicKey }
+        : {}),
+      data: {
+        transport: discovered.transport,
+        ...(discovered.associationProfile !== undefined
+          ? { associationProfile: discovered.associationProfile }
+          : {}),
+        ...(discovered.transport === 'duplex' && discovered.locallyInitiated !== undefined
+          ? { locallyInitiated: discovered.locallyInitiated }
+          : {}),
+      },
+    });
     if (!sessionFirstPeerSeen) {
       sessionFirstPeerSeen = true;
       syncTimelineMarkSession(
@@ -735,6 +829,16 @@ export async function start(
         : discovered.associationProfile ?? activeProfile;
     if (discovered.transport === 'tcp') {
       if (!authorizedRemoteProfiles.has(discovered.profilePublicKey)) {
+        // TRACE-22: a silently dropped sighting is non-conformant.
+        traceEmit({
+          layer: 'discovery',
+          level: 'debug',
+          dir: 'local',
+          msg: 'mdns-sighting',
+          transport: discovered.label,
+          remoteProfile: discovered.profilePublicKey,
+          data: { reason: 'unauthorized-profile', suppressed: true },
+        });
         return;
       }
       openFriendAssociation(discovered, association!, discovered.profilePublicKey);
@@ -745,6 +849,18 @@ export async function start(
 
   try {
     syncTimelineMarkSession('discovery-starting', `mode=${transport}`);
+    // TRACE-20 (discovery layer): which topics we are actually listening on,
+    // emitted whether or not any peer is ever seen on them.
+    for (const [topicHex, associationProfile] of topicToAssociationProfile) {
+      traceEmit({
+        layer: 'discovery',
+        level: 'info',
+        dir: 'local',
+        msg: 'topic-join',
+        localProfile: associationProfile,
+        data: { topic: topicHex, mode: transport, dht: useDht, mdns: useMdns },
+      });
+    }
     if (useDht && useMdns) {
       const dhtStart = Date.now();
       const mdnsStart = Date.now();

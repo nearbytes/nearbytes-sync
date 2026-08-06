@@ -2,7 +2,9 @@ import { randomBytes } from 'crypto';
 import type { DuplexPeer } from './peerLoop.js';
 import { createFrameDecoder, encodeFrame } from './codec.js';
 import type { Subject, SyncMessage } from './types.js';
-import { syncDebugLine, type TraceEmit } from '../syncDebugLog.js';
+import { resolveTraceEmit, computeAssocId, type TraceEmit } from '../syncDebugLog.js';
+
+const defaultTrace = resolveTraceEmit();
 
 const PROTOCOL = 'nearbytes.sync.v1' as const;
 
@@ -69,7 +71,7 @@ export function exchangeFriendHandshake(
   peer: DuplexPeer,
   options: FriendHandshakeOptions,
 ): Promise<FriendHandshakeResult> {
-  const trace = options.trace ?? syncDebugLine;
+  const trace = options.trace ?? defaultTrace;
   const localProfile = options.localProfilePublicKey.toLowerCase();
   const localPeerId = options.localPeerId.toLowerCase();
   const localInstancePublicKey = options.localInstancePublicKey.toLowerCase();
@@ -84,7 +86,14 @@ export function exchangeFriendHandshake(
     const timeout = setTimeout(() => {
       stopHandshakeData?.();
       peer.close();
-      trace('wire', 'warn', 'hello ← timed out waiting for remote hello');
+      trace({
+        layer: 'handshake',
+        level: 'warn',
+        dir: 'local',
+        msg: 'hello-timeout',
+        localProfile,
+        data: { timeoutMs: options.timeoutMs ?? 15_000 },
+      });
       reject(new SyncHandshakeError('timeout', 'sync handshake timed out', true));
     }, options.timeoutMs ?? 15_000);
 
@@ -116,7 +125,16 @@ export function exchangeFriendHandshake(
       };
       peer.write(encodeFrame(hello));
       localHelloSent = true;
-      trace('wire', 'info', `hello → subject=${JSON.stringify(options.subject)}`);
+      trace({
+        layer: 'handshake',
+        level: 'info',
+        dir: 'out',
+        msg: 'hello',
+        localProfile,
+        corrId: sessionNonce,
+        corrKind: 'nonce',
+        data: { subject: options.subject },
+      });
       tryComplete();
     };
 
@@ -129,7 +147,17 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
-        trace('wire', 'warn', `hello ← rejected: unsupported protocol ${msg.protocol}`);
+        trace({
+          layer: 'handshake',
+          level: 'warn',
+          dir: 'in',
+          msg: 'hello-rejected',
+          localProfile,
+          remoteProfile: msg.senderProfile?.toLowerCase(),
+          corrId: msg.sessionNonce,
+          corrKind: 'nonce',
+          data: { code: 'unsupported-protocol', protocol: msg.protocol },
+        });
         reject(
           new SyncHandshakeError(
             'unsupported-protocol',
@@ -143,7 +171,17 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
-        trace('wire', 'warn', 'hello ← rejected: duplicate sessionNonce');
+        trace({
+          layer: 'handshake',
+          level: 'warn',
+          dir: 'in',
+          msg: 'hello-rejected',
+          localProfile,
+          remoteProfile: msg.senderProfile?.toLowerCase(),
+          corrId: msg.sessionNonce,
+          corrKind: 'nonce',
+          data: { code: 'duplicate-nonce' },
+        });
         reject(
           new SyncHandshakeError(
             'duplicate-nonce',
@@ -160,11 +198,17 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
-        trace(
-          'wire',
-          'warn',
-          `hello ← rejected: unauthorized profile ${remote ?? '(none)'}`,
-        );
+        trace({
+          layer: 'handshake',
+          level: 'warn',
+          dir: 'in',
+          msg: 'hello-rejected',
+          localProfile,
+          remoteProfile: remote,
+          corrId: msg.sessionNonce,
+          corrKind: 'nonce',
+          data: { code: 'unauthorized-profile' },
+        });
         reject(
           new SyncHandshakeError(
             'unauthorized-profile',
@@ -179,7 +223,17 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
-        trace('wire', 'warn', 'hello ← rejected: no peer id advertised');
+        trace({
+          layer: 'handshake',
+          level: 'warn',
+          dir: 'in',
+          msg: 'hello-rejected',
+          localProfile,
+          remoteProfile: remote,
+          corrId: msg.sessionNonce,
+          corrKind: 'nonce',
+          data: { code: 'no-peer-id' },
+        });
         reject(
           new SyncHandshakeError(
             'unauthorized-profile',
@@ -194,7 +248,17 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
-        trace('wire', 'warn', 'hello ← rejected: no instance identity advertised');
+        trace({
+          layer: 'handshake',
+          level: 'warn',
+          dir: 'in',
+          msg: 'hello-rejected',
+          localProfile,
+          remoteProfile: remote,
+          corrId: msg.sessionNonce,
+          corrKind: 'nonce',
+          data: { code: 'no-instance-identity' },
+        });
         reject(
           new SyncHandshakeError(
             'unauthorized-profile',
@@ -208,7 +272,18 @@ export function exchangeFriendHandshake(
         detachHandshake();
         clearTimer();
         peer.close();
-        trace('wire', 'warn', 'hello ← rejected: instance-level loopback');
+        trace({
+          layer: 'handshake',
+          level: 'warn',
+          dir: 'in',
+          msg: 'hello-rejected',
+          localProfile,
+          remoteProfile: remote,
+          remoteInstance: remoteInstancePublicKey,
+          corrId: msg.sessionNonce,
+          corrKind: 'nonce',
+          data: { code: 'instance-loopback' },
+        });
         reject(
           new SyncHandshakeError(
             'instance-loopback',
@@ -218,11 +293,19 @@ export function exchangeFriendHandshake(
         );
         return;
       }
-      trace(
-        'wire',
-        'info',
-        `hello ← accepted profile=${remote.slice(0, 12)} inst=${remoteInstancePublicKey.slice(0, 8)}`,
-      );
+      trace({
+        layer: 'handshake',
+        level: 'info',
+        dir: 'in',
+        msg: 'hello-accepted',
+        localProfile,
+        remoteProfile: remote,
+        remoteInstance: remoteInstancePublicKey,
+        assoc: computeAssocId(localProfile, remote, remoteInstancePublicKey),
+        corrId: msg.sessionNonce,
+        corrKind: 'nonce',
+        data: { remotePeerId },
+      });
       remoteResult = {
         remoteProfile: remote,
         remotePeerId,
