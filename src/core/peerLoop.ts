@@ -940,16 +940,22 @@ export function attachPeerSession(
       const { blocks, events } = partitionWantRefs(msg.objects);
       let blockServed = 0;
       let blockMissingLocal = 0;
+      // Which hashes we could not serve. Counts alone cannot tell "we never
+      // announced this" from "we announced it and then could not produce it",
+      // and only the second is a fault.
+      const missingHashes: string[] = [];
       for (const ref of blocks) {
         if (ref.kind !== 'block') {
           continue;
         }
         if (storageRoot === undefined) {
           blockMissingLocal += 1;
+          missingHashes.push(ref.hash);
           continue;
         }
         if (!(await blockReadable(log, storageRoot, ref.hash as Hash))) {
           blockMissingLocal += 1;
+          missingHashes.push(ref.hash);
           continue;
         }
         blockServed += 1;
@@ -965,6 +971,7 @@ export function attachPeerSession(
           blocks: blocks.length,
           events: events.length,
           ...(blocks.length > 0 ? { served: blockServed, missingLocal: blockMissingLocal } : {}),
+          ...(missingHashes.length > 0 ? { missingHashes } : {}),
         },
       });
       for (const ref of events) {
