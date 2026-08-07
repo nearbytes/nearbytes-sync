@@ -955,8 +955,12 @@ export function attachPeerSession(
         blockServed += 1;
         sendBlockStream(log, runOutbound, peer, storageRoot, ref, null, 0, sessionEvents, stallGuard);
       }
+      // `want-served`, not `want-satisfied`: this describes answering the
+      // *remote's* want with our blocks. `want-satisfied` in the TRACE-20
+      // vocabulary means a want *we* armed was fulfilled, which is the
+      // opposite direction and is signalled by block-received instead.
       emit({
-        layer: 'block', level: blockMissingLocal > 0 ? 'warn' : 'debug', dir: 'local', msg: 'want-satisfied',
+        layer: 'block', level: blockMissingLocal > 0 ? 'warn' : 'debug', dir: 'local', msg: 'want-served',
         data: {
           blocks: blocks.length,
           events: events.length,
