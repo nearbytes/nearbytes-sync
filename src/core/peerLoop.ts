@@ -1307,18 +1307,23 @@ export function attachPeerSession(
     const onStall = options.onSessionStall;
     stallGuard = new SessionStallGuard(
       (reason) => {
-        // TRACE-20/22 (block layer): why the association is being torn down,
-        // with the outstanding-want count that usually explains it. A
-        // want-timeout with wantsPending > 0 is the deadlock signature.
+        // TRACE-20/22: why the association is being torn down. Only a genuine
+        // want timeout belongs to the block layer as `want-timeout`; the other
+        // four StallReasons (stream/resume/outbound timeouts and the routine
+        // periodic `session-rotation`) are session-layer `session-stall` per
+        // the §3 layer table. Reporting all of them as `want-timeout` marked
+        // healthy rotations as block failures and timed-out every outstanding
+        // hash in the object inspector.
+        const wantTimeout = reason === 'want-timeout';
         emit({
-          layer: 'block',
-          level: 'warn',
+          layer: wantTimeout ? 'block' : 'session',
+          level: reason === 'session-rotation' ? 'info' : 'warn',
           dir: 'local',
-          msg: 'want-timeout',
+          msg: wantTimeout ? 'want-timeout' : 'session-stall',
           data: {
             reason,
             wantsPending: claimedHashes.size,
-            hashes: [...claimedHashes],
+            ...(wantTimeout ? { hashes: [...claimedHashes] } : {}),
           },
         });
         onStall(reason);
